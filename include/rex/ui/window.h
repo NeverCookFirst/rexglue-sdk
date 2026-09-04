@@ -274,6 +274,10 @@ class Window {
   bool IsFullscreen() const { return fullscreen_; }
   void SetFullscreen(bool new_fullscreen);
 
+  // Resizes the non-maximized, non-fullscreen window. Applied immediately when the
+  // window is in that state; otherwise it is the size the window returns to.
+  void SetDesiredLogicalSize(uint32_t new_width, uint32_t new_height);
+
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
   const std::string& GetTitle() const { return title_; }
@@ -514,6 +518,7 @@ class Window {
   // ApplyNew* means that the value has actually been changed to something
   // different than it was previously.
   virtual void ApplyNewFullscreen() {}
+  virtual void ApplyNewDesiredLogicalSize() {}
   virtual void ApplyNewTitle() {}
   // can_apply_state_in_current_phase whether the window is in a life cycle
   // phase that would normally accept Apply calls (the native window surely

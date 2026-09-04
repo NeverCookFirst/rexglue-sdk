@@ -10,6 +10,7 @@
  */
 
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -17,6 +18,7 @@
 #include <fmt/format.h>
 #include <rex/assert.h>
 #include <rex/image_info.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ppc/function.h>
@@ -42,6 +44,12 @@
 #include <rex/system/xsemaphore.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtimer.h>
+
+REXCVAR_DEFINE_STRING(dump_achievements, "", "Kernel",
+                      "Write the achievement table of the running title (id, gamerscore, "
+                      "flags, label, descriptions) to this path once at load, then carry "
+                      "on as normal. Empty disables.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::system {
 
@@ -297,6 +305,28 @@ void KernelState::LoadAchievementsData() {
       info.gamerscore = entry.gamerscore;
       info.flags = entry.flags;
       achievements.push_back(std::move(info));
+    }
+  }
+
+  // Optional one-shot dump of the achievement table of the running title, for
+  // building an external checklist without playing through the game. Written
+  // before the move below, while the list is still readable here.
+  const std::string& dump_path = REXCVAR_GET(dump_achievements);
+  if (!dump_path.empty()) {
+    if (FILE* f = rex::filesystem::OpenFile(rex::to_path(dump_path), "w")) {
+      uint32_t total = 0;
+      std::fprintf(f, "id\tgamerscore\tflags\tlabel\tdescription\tlocked_description\n");
+      for (const auto& a : achievements) {
+        total += a.gamerscore;
+        std::fprintf(f, "%u\t%u\t0x%08X\t%s\t%s\t%s\n", a.id, a.gamerscore, a.flags, a.label.c_str(),
+                     a.description.c_str(), a.unachieved_description.c_str());
+      }
+      std::fprintf(f, "# %zu achievements, %u gamerscore total\n", achievements.size(), total);
+      std::fclose(f);
+      REXLOG_INFO("Wrote {} achievements ({} gamerscore) to {}", achievements.size(), total,
+                  dump_path);
+    } else {
+      REXLOG_WARN("dump_achievements: cannot write {}", dump_path);
     }
   }
 

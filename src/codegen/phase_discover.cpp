@@ -265,6 +265,90 @@ void discoverAllFunctions(CodegenContext& ctx) {
   }
 
   REXCODEGEN_TRACE("Analyze: {} total functions after vtable scan", graph.functionCount());
+
+  // Pointer-table scanning. The block above only sees tables that RTTI leads it
+  // to; this one finds the rest by shape. See pointer_table_scan in
+  // codegen_flags.cpp for why that gap matters.
+  if (REXCVAR_GET(pointer_table_scan)) {
+    const size_t minRun = REXCVAR_GET(pointer_table_min_run);
+    size_t tables = 0;
+    size_t newFunctions = 0;
+
+    // Collected per run and only committed once the run proves long enough, so
+    // that isolated code-shaped words in ordinary data are not claimed.
+    std::vector<uint32_t> run;
+
+    auto commitRun = [&]() {
+      if (run.size() >= minRun) {
+        tables++;
+        for (uint32_t funcAddr : run) {
+          if (graph.isEntryPoint(funcAddr))
+            continue;
+          if (binary.isInImportExportRange(funcAddr))
+            continue;
+          // A table entry names a function ENTRY. An address landing inside a
+          // function already discovered means this word only looked like a
+          // pointer; claiming it would split that function in two and leave its
+          // own internal branches crossing the new boundary, which fails at
+          // runtime as "Unresolved branch from X to Y".
+          const auto* container = graph.getFunctionContaining(funcAddr);
+          if (container && container->base() != funcAddr)
+            continue;
+          graph.addFunction(funcAddr, 4, FunctionAuthority::VTABLE, true);
+          newFunctions++;
+        }
+      }
+      run.clear();
+    };
+
+    for (const auto& section : binary.sections()) {
+      if (!section.data || section.size < 4) {
+        continue;
+      }
+      // Code sections hold instructions, not pointer tables, and scanning them
+      // would read every branch as a table entry.
+      if (binary.isExecutable(section.baseAddress)) {
+        continue;
+      }
+
+      for (size_t offset = 0; offset + 4 <= section.size; offset += 4) {
+        const uint32_t value = load_and_swap<uint32_t>(section.data + offset);
+
+        // A PPC function address: non-null, instruction-aligned, and inside an
+        // executable section.
+        if (value != 0 && (value & 0x3) == 0 && binary.isExecutable(value)) {
+          run.push_back(value);
+        } else {
+          commitRun();
+        }
+      }
+      commitRun();
+    }
+
+    REXCODEGEN_TRACE("Analyze: pointer-table scan found {} tables, {} new functions", tables,
+                     newFunctions);
+
+    // Newly claimed functions call further functions of their own; converge the
+    // same way the vtable pass does.
+    if (newFunctions > 0) {
+      size_t iteration = 0;
+      const size_t maxIterations = REXCVAR_GET(max_vtable_iterations);
+
+      while (iteration < maxIterations) {
+        iteration++;
+
+        auto knownFunctions = buildKnownFunctions(graph);
+        if (discoverPendingFunctions(ctx, knownFunctions) == 0)
+          break;
+
+        if (graph.functionCount() == lastFunctionCount)
+          break;
+        lastFunctionCount = graph.functionCount();
+      }
+    }
+
+    REXCODEGEN_TRACE("Analyze: {} total functions after pointer-table scan", graph.functionCount());
+  }
 }
 
 //=============================================================================
@@ -352,6 +436,16 @@ void functionPointerScan(CodegenContext& ctx) {
         }
 
         // Register as function with DISCOVERED authority and hasXrefs=true
+        // The distance heuristic above only catches labels near the loading
+        // instruction. Landing anywhere inside an already-discovered function
+        // splits it, and its internal branches then fail at runtime with
+        // "Unresolved branch from X to Y", so reject that outright.
+        {
+          const auto* container = graph.getFunctionContaining(fullAddr);
+          if (container && container->base() != fullAddr)
+            continue;
+        }
+
         graph.addFunction(fullAddr, 4, FunctionAuthority::DISCOVERED, true);
         existingFunctions.insert(fullAddr);
         foundCount++;
@@ -384,6 +478,16 @@ void functionPointerScan(CodegenContext& ctx) {
         int32_t distance = static_cast<int32_t>(fullAddr) - static_cast<int32_t>(addr);
         if (distance > -0x1000 && distance < 0x1000)
           continue;
+
+        // The distance heuristic above only catches labels near the loading
+        // instruction. Landing anywhere inside an already-discovered function
+        // splits it, and its internal branches then fail at runtime with
+        // "Unresolved branch from X to Y", so reject that outright.
+        {
+          const auto* container = graph.getFunctionContaining(fullAddr);
+          if (container && container->base() != fullAddr)
+            continue;
+        }
 
         graph.addFunction(fullAddr, 4, FunctionAuthority::DISCOVERED, true);
         existingFunctions.insert(fullAddr);
@@ -424,6 +528,9 @@ namespace phases {
 VoidResult Discover(CodegenContext& ctx, ProgressReporter* reporter) {
   (void)reporter;
   discoverAllFunctions(ctx);
+  if (REXCVAR_GET(code_pointer_scan)) {
+    functionPointerScan(ctx);
+  }
   return Ok();
 }
 

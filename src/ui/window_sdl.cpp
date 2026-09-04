@@ -298,6 +298,16 @@ void WindowSDL::ApplyNewFullscreen() {
   SDL_SetWindowFullscreen(sdl_window_, IsFullscreen());
 }
 
+void WindowSDL::ApplyNewDesiredLogicalSize() {
+  if (!sdl_window_ || IsFullscreen()) {
+    // In fullscreen this is only the size to come back to; SDL would fight the
+    // fullscreen state for it.
+    return;
+  }
+  SDL_SetWindowSize(sdl_window_, int(GetDesiredLogicalWidth()), int(GetDesiredLogicalHeight()));
+  SDL_SetWindowPosition(sdl_window_, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+}
+
 void WindowSDL::ApplyNewTitle() {
   if (!sdl_window_) {
     return;

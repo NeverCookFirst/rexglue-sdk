@@ -19,6 +19,7 @@
 #include <rex/input/input_system.h>
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
+#include <rex/input/portal/emulated_toypad.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/input/state_merge.h>
 #include <rex/input/xinput/xinput_input_driver.h>
@@ -41,11 +42,14 @@ constexpr uint32_t kSyntheticOrdinal = UINT32_MAX;
 
 InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
 
+// Out-of-line so unique_ptr<Portal> sees the complete type.
 InputSystem::~InputSystem() = default;
 
 X_STATUS InputSystem::Setup() {
   return X_STATUS_SUCCESS;
 }
+
+void InputSystem::SetPortal(std::unique_ptr<Portal> portal) { portal_ = std::move(portal); }
 
 void InputSystem::Shutdown() {
   // device_owners_ holds raw driver pointers.
@@ -346,6 +350,10 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
     if (mnk_driver->Setup() == X_STATUS_SUCCESS) {
       input->AddDriver(std::move(mnk_driver));
     }
+
+    // Emulated LEGO Dimensions ToyPad. Only outside tool mode: it starts a
+    // loopback listener thread, which codegen has no use for.
+    input->SetPortal(std::make_unique<EmulatedToypad>());
   }
 
   // NOP driver (primary in tool mode, fallback otherwise)

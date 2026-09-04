@@ -35,6 +35,13 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, 
     .allowed({"none", "fxaa", "fxaa_extreme"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// The guest paces itself off the vblank: a 30 fps title swaps on every second one, so
+// running the vblank at twice the video mode's refresh rate hands it twice the frames.
+// "30" keeps the cadence the console ran at.
+REXCVAR_DEFINE_STRING(frame_rate, "30", "GPU",
+                      "Frames per second the guest vblank is paced for: 30 as on console, or 60")
+    .allowed({"30", "60"});
+
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
                     "runtime spikes and freezes when playing the game not for the first time.");
@@ -158,10 +165,21 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+        uint64_t last_interval_ticks = 0;
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+          // Read the rate every pass so the setting can be changed while running.
+          uint64_t vblanks_per_refresh = REXCVAR_GET(frame_rate) == "60" ? 2 : 1;
           uint64_t interval_ticks =
-              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+              REXCVAR_GET(vsync)
+                  ? std::max(uint64_t(1), vsync_interval_ticks / vblanks_per_refresh)
+                  : no_vsync_interval_ticks;
+          // Changing the cadence restarts the schedule. Without this the backlog measured
+          // against the old interval fires as a burst of vblanks at the new one.
+          if (interval_ticks != last_interval_ticks) {
+            last_interval_ticks = interval_ticks;
+            last_frame_time = current_time;
+          }
           while (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();
             last_frame_time += interval_ticks;

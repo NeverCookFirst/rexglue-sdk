@@ -148,6 +148,47 @@ VirtualKey ParseVirtualKey(std::string_view name) {
   return (it != kKeyNames.end()) ? it->second : VirtualKey::kNone;
 }
 
+// A bind is "Key" or "Mod+...+Key", e.g. "F4" or "Alt+Return". The modifiers named must
+// be held and the ones not named must not be, so Alt+Return does not also fire a plain
+// Return bind, and F4 does not fire while Alt is down.
+struct BindCombo {
+  VirtualKey key = VirtualKey::kNone;
+  bool shift = false;
+  bool ctrl = false;
+  bool alt = false;
+  bool super = false;
+};
+
+BindCombo ParseBindCombo(std::string_view spec) {
+  BindCombo combo;
+  size_t start = 0;
+  while (true) {
+    size_t plus = spec.find('+', start);
+    // A '+' at the very end is part of the key name, not a separator.
+    if (plus == std::string_view::npos || plus + 1 >= spec.size()) {
+      combo.key = ParseVirtualKey(spec.substr(start));
+      break;
+    }
+    std::string_view part = spec.substr(start, plus - start);
+    if (part == "Shift") {
+      combo.shift = true;
+    } else if (part == "Ctrl" || part == "Control") {
+      combo.ctrl = true;
+    } else if (part == "Alt") {
+      combo.alt = true;
+    } else if (part == "Super" || part == "Win" || part == "Cmd") {
+      combo.super = true;
+    } else {
+      // Not a modifier we know: take the whole spec as a plain key name.
+      BindCombo plain;
+      plain.key = ParseVirtualKey(spec);
+      return plain;
+    }
+    start = plus + 1;
+  }
+  return combo;
+}
+
 std::string VirtualKeyToString(VirtualKey vk) {
   for (const auto& [name, key] : kKeyNames) {
     if (key == vk) {
@@ -213,12 +254,17 @@ bool ProcessKeyEvent(KeyEvent& e) {
   for (auto& entry : g_binds) {
     if (!entry.callback)
       continue;
-    VirtualKey vk = ParseVirtualKey(entry.current_key);
-    if (vk != VirtualKey::kNone && e.virtual_key() == vk) {
-      entry.callback();
-      e.set_handled(true);
-      return true;
+    BindCombo combo = ParseBindCombo(entry.current_key);
+    if (combo.key == VirtualKey::kNone || e.virtual_key() != combo.key) {
+      continue;
     }
+    if (e.is_shift_pressed() != combo.shift || e.is_ctrl_pressed() != combo.ctrl ||
+        e.is_alt_pressed() != combo.alt || e.is_super_pressed() != combo.super) {
+      continue;
+    }
+    entry.callback();
+    e.set_handled(true);
+    return true;
   }
   return false;
 }

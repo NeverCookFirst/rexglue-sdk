@@ -19,12 +19,19 @@
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
+#include <rex/cvar.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
 #include <rex/system/xam/content_manager.h>
 #include <rex/system/xfile.h>
 #include <rex/system/xobject.h>
+
+// Defined in kernel/xam/xam_content.cpp. Xenia ORs this into every opened
+// package's licence (content_manager.cc:459) and LEGO Dimensions relies on
+// that: the DLC .header files carry only bit 0, while the game tests higher
+// bits before it will unlock a character wave.
+REXCVAR_DECLARE(uint32_t, license_mask);
 
 namespace rex {
 namespace system {
@@ -303,6 +310,9 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
   package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
       data.file_name(), xuid, kernel_state_->title_id(), data.content_type));
   content_license = package->GetPackageLicense();
+  if (REXCVAR_GET(license_mask) > 1) {
+    content_license |= REXCVAR_GET(license_mask);
+  }
 
   {
     auto global_lock = global_critical_region_.Acquire();

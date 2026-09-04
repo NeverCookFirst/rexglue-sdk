@@ -353,6 +353,12 @@ union ResolveEdramInfo {
     // of the resolve region with the contents of the first surely covered
     // column / row with resolution scaling.
     uint32_t fill_half_pixel_offset : 1;
+    // Some games appear overexposed unless full 8_8_8_8_GAMMA resolves decode
+    // PWL gamma to linear before MSAA averaging / conversion, then write gamma
+    // bytes again for gamma dests. Kept as a constant in the resolve shader.
+    // Ported from xenia-canary d1195052/2ddc5ef7/fc48d37c together with the
+    // rebuilt resolve shaders in shaders/bytecode - the old ones ignore the bit.
+    uint32_t decode_pwl_gamma : 1;
   };
   ResolveEdramInfo() : packed(0) { static_assert_size(*this, sizeof(packed)); }
 };

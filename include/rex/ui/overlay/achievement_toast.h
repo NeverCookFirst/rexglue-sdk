@@ -39,6 +39,11 @@ class AchievementToastDialog : public AchievementNotificationDialog {
   void OnDraw(ImGuiIO& io) override;
 
  private:
+  // Plays the configured unlock sound, if any. Called when a toast first
+  // becomes visible, so a queued achievement sounds on its own turn.
+  void PlayUnlockSound();
+
+ private:
   static constexpr float kDisplaySeconds = 4.5f;
 
   struct PendingToast {

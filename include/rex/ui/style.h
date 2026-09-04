@@ -30,6 +30,10 @@ struct AchievementsStyle {
   ImVec4 progress_bar{0.30f, 0.80f, 0.40f, 1.00f};
   ImVec4 unlocked_icon_tint{1.00f, 1.00f, 1.00f, 1.00f};
   ImVec4 locked_icon_tint{0.45f, 0.45f, 0.45f, 0.80f};
+  /// Title bar and border of the achievements window. Kept separate from the
+  /// global ImGui palette so this one window can carry the achievement green
+  /// while the rest of the UI follows the app's own accent.
+  ImVec4 window_accent{0.55f, 0.78f, 0.25f, 1.00f};
   ImVec2 window_padding{14.0f, 12.0f};
   ImVec2 item_spacing{8.0f, 6.0f};
   float icon_size = 44.0f;

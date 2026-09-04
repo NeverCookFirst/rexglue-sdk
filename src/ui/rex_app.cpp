@@ -15,11 +15,15 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/perf/counter.h>
 #include <rex/ui/flags.h>
 #include <rex/kernel/crt/heap.h>
 #include <rex/filesystem.h>
 #include <rex/logging/sink.h>
 #include <rex/logging.h>
+#include <rex/audio/audio_system.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xthread.h>
 #include <rex/ui/overlay/achievement_toast.h>
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
@@ -37,6 +41,7 @@
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/renderdoc_capture.h>
 #include <rex/version.h>
 
 #include <fmt/format.h>
@@ -49,6 +54,11 @@
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                       "GPU emulation")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
+                      "Graphics backend the GPU plugin should construct: 'any' (plugin's own "
+                      "preference), 'd3d12' or 'vulkan'")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
@@ -89,6 +99,23 @@ bool ReXApp::OnInitialize() {
   if (!SetupPresentation())
     return false;
 
+  // Ported from TheSimpsonsGameRecomp's SDK fork: SetGuestFrameStats was
+  // declared and wired into the F3 debug overlay's constructor, but nothing
+  // ever called it - the "Guest: FPS" line was dead, always skipped by the
+  // `stats.frame_count > 0` check in debug_overlay.cpp. Feed it from the same
+  // fps / frame_time_us counters the perf_log_csv logger uses (set every swap
+  // in command_processor.cpp), so the overlay shows live numbers.
+  SetGuestFrameStats([]() -> ui::FrameStats {
+    static uint64_t overlay_frame_counter = 0;
+    ++overlay_frame_counter;
+    ui::FrameStats stats;
+    stats.frame_time_ms =
+        double(rex::perf::GetSnapshotCounter(rex::perf::CounterId::kFrameTimeUs)) / 1000.0;
+    stats.fps = double(rex::perf::GetSnapshotCounter(rex::perf::CounterId::kFps));
+    stats.frame_count = overlay_frame_counter;
+    return stats;
+  });
+
   auto paths = OnFinalizePaths(resolved_defaults_, MakeResumeCallback());
   if (!paths) {
     // Async: consumer will invoke resume when ready. OnInitialize returns
@@ -104,6 +131,20 @@ bool ReXApp::OnInitialize() {
 
 bool ReXApp::SetupEnvironment() {
   auto exe_dir = rex::filesystem::GetExecutableFolder();
+
+  // Load the config before any path cvar is read. It used to be loaded only
+  // after the paths had been resolved, which meant game_data_root and its
+  // siblings had to arrive on the command line even when the .toml listed
+  // them - every launch needed a wrapper script just to pass paths.
+  //
+  // Safe with respect to precedence: cvar sources are ranked, and a value from
+  // the config (kConfig) never overwrites one already set from the command line
+  // (kCommandLine), so explicit flags still win over the file.
+  const std::filesystem::path startup_config_path =
+      exe_dir / (std::string(GetName()) + ".toml");
+  if (std::filesystem::exists(startup_config_path)) {
+    rex::cvar::LoadConfig(startup_config_path);
+  }
 
   std::filesystem::path game_dir;
   std::string game_data_cvar = REXCVAR_GET(game_data_root);
@@ -314,7 +355,7 @@ bool ReXApp::SetupPresentation() {
   OnPreSetup(config_);
 
   if (!config_.graphics && !config_.gpu_plugin.empty()) {
-    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin);
+    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin, REXCVAR_GET(gpu_backend));
     if (!config_.graphics) {
       // Fatal by design: no silent headless fallback.
       auto msg =
@@ -409,6 +450,28 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
       console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
     }
   });
+  // Alt+Enter is the convention for this everywhere else, so it is the default. Going
+  // windowed also applies the windowed size, since a window that has only ever been
+  // fullscreen still carries whatever size it was created with.
+  rex::ui::RegisterBind("bind_fullscreen", "Alt+Return",
+                        "Toggle between borderless fullscreen and a window", [this] {
+                          if (!window_) {
+                            return;
+                          }
+                          bool go_fullscreen = !window_->IsFullscreen();
+                          if (go_fullscreen) {
+                            window_->SetFullscreen(true);
+                          } else {
+                            window_->SetFullscreen(false);
+                            window_->SetDesiredLogicalSize(
+                                uint32_t(std::max(1, REXCVAR_GET(windowed_width))),
+                                uint32_t(std::max(1, REXCVAR_GET(windowed_height))));
+                          }
+                          // Keep the cvar in step, so the settings overlay shows the truth
+                          // and the state is what gets saved.
+                          REXCVAR_SET(fullscreen, go_fullscreen);
+                        });
+
   rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
     if (settings_overlay_) {
       settings_overlay_.reset();
@@ -416,6 +479,13 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
       settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
     }
   });
+  // Capture the next frame with RenderDoc. The usual F12 route is unusable on
+  // this machine: FPS Monitor registers its own Vulkan layer under the name
+  // VK_LAYER_RENDERDOC_Capture, so RenderDoc's key handling never gets a look
+  // in. This goes through the in-app API instead, which needs nothing but the
+  // process having been launched under RenderDoc.
+  rex::ui::RegisterBind("bind_renderdoc_capture", "F9", "Trigger a RenderDoc frame capture",
+                        [] { rex::ui::TriggerRenderDocCapture(); });
   rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
     if (achievements_overlay_) {
       achievements_overlay_.reset();
@@ -533,13 +603,53 @@ void ReXApp::OnDpiChanged(ui::UISetupEvent& e) {
   OnDpiScaleChanged(float(window_->GetDpi()) / float(window_->GetMediumDpi()));
 }
 
+void ReXApp::SetGuestPaused(bool paused) {
+  if (guest_paused_ == paused || !runtime_) {
+    return;
+  }
+  auto* kernel_state = runtime_->kernel_state();
+  if (!kernel_state) {
+    return;
+  }
+  guest_paused_ = paused;
+
+  // Only the guest's own threads. The host threads behind them - the GPU worker, the
+  // audio backend - have to keep running, or nothing would be left to resume them.
+  auto threads = kernel_state->object_table()->GetObjectsByType<rex::system::XThread>();
+  for (auto& thread : threads) {
+    if (!thread || !thread->is_guest_thread()) {
+      continue;
+    }
+    if (paused) {
+      thread->Suspend(nullptr);
+    } else {
+      thread->Resume(nullptr);
+    }
+  }
+
+  if (auto* audio = static_cast<rex::audio::AudioSystem*>(runtime_->audio_system())) {
+    if (paused) {
+      audio->Pause();
+    } else {
+      audio->Resume();
+    }
+  }
+
+  REXLOG_INFO("Guest {} ({} threads)", paused ? "suspended" : "resumed", threads.size());
+}
+
 void ReXApp::OnGotFocus(ui::UISetupEvent& e) {
   (void)e;
+  // Always resume, even if the setting was turned off while the game sat suspended.
+  SetGuestPaused(false);
   OnWindowFocusChanged(true);
 }
 
 void ReXApp::OnLostFocus(ui::UISetupEvent& e) {
   (void)e;
+  if (REXCVAR_GET(pause_when_unfocused)) {
+    SetGuestPaused(true);
+  }
   OnWindowFocusChanged(false);
 }
 

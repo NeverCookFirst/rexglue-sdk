@@ -233,6 +233,9 @@ class SharedMemory {
   // Triggers the watches (global and per-range), removing triggered range
   // watches.
   void FireWatches(uint32_t page_first, uint32_t page_last, bool invalidated_by_gpu);
+  // Same, for callers that already hold the global critical region.
+  void FireWatchesLocked(const std::unique_lock<std::recursive_mutex>& global_lock,
+                         uint32_t page_first, uint32_t page_last, bool invalidated_by_gpu);
   // Unlinks and frees the range and its nodes. Call this in the global critical
   // region.
   void UnlinkWatchRange(WatchRange* range);

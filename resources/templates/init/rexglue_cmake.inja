@@ -117,7 +117,16 @@ endmacro()
 add_custom_command(
     OUTPUT "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.build.stamp"
            {{ cmake_var("REXGLUE_ENTRYPOINT_GENERATED_SOURCES") }}
-    COMMAND $<TARGET_FILE:rex::rexglue> codegen {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml
+    # --pointer_table_scan (this fork, 2026-09-02) finds functions reachable only
+    # through non-RTTI arrays of code pointers; without it those addresses
+    # surface one runtime crash at a time. It lives here, in the template,
+    # because codegen re-renders generated/rexglue.cmake on every run and would
+    # wipe a flag added to the generated copy.
+    # --code_pointer_scan is NOT enabled: it finds ~340 more functions but
+    # declares some of them inside existing functions, and emit_conditional_branch
+    # cannot yet resolve a branch across such a split without emitting a goto to
+    # an unlabelled address (see the comment there).
+    COMMAND $<TARGET_FILE:rex::rexglue> codegen --pointer_table_scan {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml
     DEPFILE "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.d"
     WORKING_DIRECTORY {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}
     COMMENT "Generating recompiled code for {{ names.snake_case }}"

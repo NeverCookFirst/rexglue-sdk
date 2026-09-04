@@ -36,6 +36,21 @@ REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
 // in sync whenever this cvar is changed at runtime.
 REXCVAR_DEFINE_BOOL(fullscreen, true, "UI/Window", "Start the window in fullscreen mode");
 
+// The size the fullscreen toggle drops the window to. Separate from window_width /
+// window_height, which are the startup size and cannot change once the window is up.
+// Off by default: a game left running in the background is the normal expectation, and
+// stopping it would surprise anyone who alt-tabs out mid-cutscene.
+REXCVAR_DEFINE_BOOL(pause_when_unfocused, false, "UI/Window",
+                    "Suspend the game while its window is not focused");
+
+REXCVAR_DEFINE_INT32(windowed_width, 1280, "UI/Window",
+                     "Window width the fullscreen toggle restores to, in logical pixels")
+    .range(320, 8192);
+
+REXCVAR_DEFINE_INT32(windowed_height, 720, "UI/Window",
+                     "Window height the fullscreen toggle restores to, in logical pixels")
+    .range(240, 8192);
+
 REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
                      "Monitor index to display on (0 = default, 1 = primary, 2 = "
                      "second monitor, etc.)")
@@ -282,6 +297,24 @@ void Window::SetFullscreen(bool new_fullscreen) {
   }
   WindowDestructionReceiver destruction_receiver(this);
   ApplyNewFullscreen();
+  if (destruction_receiver.IsWindowDestroyedOrStateInapplicable()) {
+    return;
+  }
+}
+
+void Window::SetDesiredLogicalSize(uint32_t new_width, uint32_t new_height) {
+  if (!new_width || !new_height) {
+    return;
+  }
+  if (desired_logical_width_ == new_width && desired_logical_height_ == new_height) {
+    return;
+  }
+  OnDesiredLogicalSizeUpdate(new_width, new_height);
+  if (!CanApplyState()) {
+    return;
+  }
+  WindowDestructionReceiver destruction_receiver(this);
+  ApplyNewDesiredLogicalSize();
   if (destruction_receiver.IsWindowDestroyedOrStateInapplicable()) {
     return;
   }

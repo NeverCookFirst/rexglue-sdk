@@ -34,6 +34,8 @@ REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data pat
 REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
 REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
 
+REXCVAR_DECLARE(std::string, perf_log_csv);
+
 namespace rex {
 
 // Static instance for global access
@@ -102,6 +104,15 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   };
 
   // Initialize SEH exception support for hardware exception handling
+  // Ported from TheSimpsonsGameRecomp's SDK fork: perf_log_csv was defined as
+  // a cvar but never connected to SetCsvLogPath(), so per-frame CSV logging
+  // (fps, frame_time_us, draw calls, ...) was silent dead code.
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
+  if (!REXCVAR_GET(perf_log_csv).empty()) {
+    rex::perf::SetCsvLogPath(REXCVAR_GET(perf_log_csv));
+  }
+#endif
+
   rex::initialize_seh();
 
   // Initialize clock

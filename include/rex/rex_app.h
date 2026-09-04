@@ -280,6 +280,11 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   void OnDpiChanged(ui::UISetupEvent& e) override;
   void OnGotFocus(ui::UISetupEvent& e) override;
   void OnLostFocus(ui::UISetupEvent& e) override;
+
+  // Suspends or resumes the guest's own threads and its audio. Withholding the vblank
+  // is not enough on its own: the guest threads keep running and the audio keeps
+  // playing, which is what "paused" is meant to stop.
+  void SetGuestPaused(bool paused);
   void OnMinimized(ui::UIEvent& e) override;
   void OnRestored(ui::UIEvent& e) override;
 
@@ -298,6 +303,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::Window> window_;
   std::thread module_thread_;
   std::atomic<bool> shutting_down_{false};
+  bool guest_paused_ = false;
   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
   std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
 

@@ -37,6 +37,24 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
+// Deliberately separate from vsync: vsync can only lock to the display's own
+// refresh, so on a 90 Hz panel it caps at 90, and falling below the refresh
+// costs a whole interval at once (90 -> 45). This paces the guest's frame
+// boundary directly, so any target works on any refresh rate.
+REXCVAR_DEFINE_INT32(framerate_limit, 0, "GPU",
+                     "Cap the guest frame rate in FPS (0 = unlimited)")
+    .range(0, 1000);
+
+// A/B switch for the two GPU-thread wait-policy patches ported from
+// TheSimpsonsGameRecomp on 2026-09-02 (short yield burst + event wait on ring
+// drain, and <=500 us vblank polling). Hot-reloadable so a suspected driver
+// crash can be bisected without a rebuild. false = upstream ReXGlue behaviour.
+REXCVAR_DEFINE_BOOL(gpu_thread_fast_wait, true, "GPU",
+                    "Use the low-latency GPU thread wait policy (short yield burst, then "
+                    "event wait; sub-millisecond vblank polling). false restores the "
+                    "original 500-spin / 5 ms and full-interval sleeps.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
@@ -214,20 +232,37 @@ void CommandProcessor::WorkerThreadMain() {
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
       // We've run out of commands to execute.
-      // We spin here waiting for new ones, as the overhead of waiting on our
-      // event is too high.
+      // Ported from TheSimpsonsGameRecomp's SDK fork: the old policy was 500
+      // sched-yield spins before ever touching the event, then a 5 ms timed
+      // wait. That made sense for an emulator whose GPU thread had a core to
+      // itself; in a recomp the same cores also run the recompiled game code,
+      // and a yield storm on every ring drain steals cycles from the thread
+      // that is about to feed us more commands. UpdateWritePointer signals the
+      // event, so a real wait wakes in microseconds; keep only a short yield
+      // burst to catch back-to-back submissions, then sleep on the event. The
+      // 1 ms timeout (down from 5) bounds how long a CallInThread posted from
+      // another thread can sit unnoticed, since those don't signal the event.
       PrepareForWait();
+      const bool fast_wait = REXCVAR_GET(gpu_thread_fast_wait);
       uint32_t loop_count = 0;
       do {
-        // If we spin around too much, revert to a "low-power" state.
-        if (loop_count > 500) {
-          const int wait_time_ms = 5;
-          rex::thread::Wait(write_ptr_index_event_.get(), true,
-                            std::chrono::milliseconds(wait_time_ms));
+        if (fast_wait) {
+          if (loop_count < 32) {
+            rex::thread::MaybeYield();
+            loop_count++;
+          } else {
+            rex::thread::Wait(write_ptr_index_event_.get(), true,
+                              std::chrono::milliseconds(1));
+          }
+        } else {
+          // Original policy: 500 yields, then 5 ms timed waits.
+          if (loop_count > 500) {
+            rex::thread::Wait(write_ptr_index_event_.get(), true,
+                              std::chrono::milliseconds(5));
+          }
+          rex::thread::MaybeYield();
+          loop_count++;
         }
-
-        rex::thread::MaybeYield();
-        loop_count++;
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
@@ -926,6 +961,51 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
   return true;
 }
 
+namespace {
+
+// Holds the guest frame boundary back until the next slot in a fixed cadence.
+// Called once per swap, from the GPU thread only, so the deadline can live in a
+// static the way the frame-time counter above it does.
+void LimitFramerate() {
+  static uint64_t next_deadline = 0;
+
+  const int32_t limit = REXCVAR_GET(framerate_limit);
+  if (limit <= 0) {
+    next_deadline = 0;
+    return;
+  }
+
+  const uint64_t frequency = rex::chrono::Clock::QueryHostTickFrequency();
+  const uint64_t interval = frequency / uint64_t(limit);
+  uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+
+  // A cold start, or a gap far past the deadline (loading, alt-tab, a stall):
+  // re-anchor to now instead of sprinting through several frames to "catch up",
+  // which would look like a burst of fast-forward.
+  if (next_deadline == 0 || now > next_deadline + interval) {
+    next_deadline = now + interval;
+    return;
+  }
+
+  while (now < next_deadline) {
+    const uint64_t remaining_us = (next_deadline - now) * 1000000 / frequency;
+    if (remaining_us > 1500) {
+      // Give back all but the last millisecond. Sleep granularity on Windows is
+      // ~1 ms even with a raised timer resolution, and overshooting the deadline
+      // is exactly what turns a cap the GPU can hold into visible judder, so the
+      // tail is spun rather than slept.
+      rex::thread::Sleep(std::chrono::microseconds(remaining_us - 1000));
+    } else {
+      rex::thread::MaybeYield();
+    }
+    now = rex::chrono::Clock::QueryHostTickCount();
+  }
+
+  next_deadline += interval;
+}
+
+}  // namespace
+
 bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
@@ -959,6 +1039,10 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+
+  // After the present, so the wait absorbs the time the frame finished early
+  // rather than delaying the frame itself.
+  LimitFramerate();
 
   ++counter_;
   return true;
@@ -1037,7 +1121,19 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
         } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          // Ported from TheSimpsonsGameRecomp's SDK fork: `wait` is the guest's
+          // suggested poll interval, not a required duration (real hardware
+          // just re-polls). Sleeping the full interval (e.g. 4 ms at the common
+          // 0x400) meant the condition was noticed up to that long after it
+          // became true, serializing the ring behind a stall that had already
+          // ended. Poll at least every 500 us instead; still >95% idle, but the
+          // wake-up lag stops being a per-frame tax.
+          uint64_t wait_us = uint64_t(wait) * 1000 / 0x100;
+          if (!REXCVAR_GET(gpu_thread_fast_wait)) {
+            wait_us = uint64_t(wait / 0x100) * 1000;  // original full-interval sleep
+          }
+          rex::thread::Sleep(std::chrono::microseconds(
+              REXCVAR_GET(gpu_thread_fast_wait) ? std::min<uint64_t>(wait_us, 500) : wait_us));
         }
         rex::thread::SyncMemory();
         ReturnFromWait();

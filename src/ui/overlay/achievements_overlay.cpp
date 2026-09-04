@@ -43,6 +43,17 @@ void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, style.window_padding);
   ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, style.item_spacing);
 
+  // This window wears the achievement colour rather than the global accent, so
+  // its chrome is pushed here instead of being left to the palette. The
+  // inactive title bar is the same hue at lower value, which is how the stock
+  // ImGui palette relates its own title states.
+  const ImVec4& accent = style.window_accent;
+  const ImVec4 accent_dim(accent.x * 0.55f, accent.y * 0.55f, accent.z * 0.55f, accent.w);
+  ImGui::PushStyleColor(ImGuiCol_TitleBgActive, accent);
+  ImGui::PushStyleColor(ImGuiCol_TitleBg, accent_dim);
+  ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, accent_dim);
+  ImGui::PushStyleColor(ImGuiCol_Border, accent);
+
   if (ImGui::Begin("Achievements##overlay", nullptr, ImGuiWindowFlags_NoCollapse)) {
     const auto achievements = achievements_->ListAchievements();
 
@@ -140,6 +151,7 @@ void AchievementsOverlayDialog::OnDraw(ImGuiIO& io) {
   }
   ImGui::End();
 
+  ImGui::PopStyleColor(4);
   ImGui::PopStyleVar(2);
 }
 

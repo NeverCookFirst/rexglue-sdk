@@ -279,6 +279,33 @@ void BuilderContext::emit_function_call(uint32_t address) {
 void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
   uint32_t target = insn.operands[1];
 
+  // A conditional branch to the entry of the function being emitted is a loop
+  // back to the top, never a tail call. classifyTarget() has to answer that
+  // from getFunctionContaining(base), which resolves to the nearest preceding
+  // entry point; when a second legitimate entry (an address the game only ever
+  // reaches by indirect call, so it is declared separately) sits inside this
+  // function's range, that lookup returns the wrong node, the branch is read as
+  // a call into another function, no CallTarget exists for it, and the emitted
+  // REX_FATAL kills the game at runtime. Here the function knows its own base,
+  // so answer directly. LEGO Dimensions 2026-09-02: sub_83988648 spans
+  // 0x83988648-0x8398A8C4 and also contains the declared entry 0x83988EB0; the
+  // loop at 0x8398A800 crashed on arrival in the Sonic world.
+  // Deliberately ONLY the entry, not the whole body. Extending this to any
+  // target inside the function looks right and would make code_pointer_scan
+  // usable (that scan finds ~340 more functions here, but declares some inside
+  // existing functions, and every branch across such a split becomes a runtime
+  // fatal). Both attempts - FunctionNode::containsAddress() and a scan of
+  // fn.blocks() - emitted a goto to an address the label pass never labels, and
+  // the generated code stopped compiling ("use of undeclared label", e.g.
+  // sub_8318C5F8 -> 0x8318C618). Doing it properly means teaching the label
+  // collection in FunctionNode::recompile() the same rule; until then the entry
+  // case alone is provably safe, because a function's first block always starts
+  // there.
+  if (target == fn.base()) {
+    println("\tif ({}{}.{}) goto loc_{:08X};", not_ ? "!" : "", cr(insn.operands[0]), cond, target);
+    return;
+  }
+
   // Use classifyTarget for consistent branch classification
   // false = branch instruction (not a call), so own-base means loop back
   auto kind = graph().classifyTarget(target, base, false);

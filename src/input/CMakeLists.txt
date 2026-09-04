@@ -7,6 +7,8 @@ add_library(rexinput OBJECT
     state_merge.cpp
     mnk/mnk_input_driver.cpp
     nop/nop_input_driver.cpp
+    portal/portal.cpp
+    portal/emulated_toypad.cpp
 )
 add_library(rex::input ALIAS rexinput)
 
@@ -36,3 +38,7 @@ else()
 endif()
 
 target_link_libraries(rexinput PUBLIC rexcore rexui SDL3::SDL3)
+if(WIN32)
+    # Loopback listener in portal/emulated_toypad.cpp.
+    target_link_libraries(rexinput PUBLIC ws2_32)
+endif()

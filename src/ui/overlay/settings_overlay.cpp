@@ -24,6 +24,21 @@
 
 namespace rex::ui {
 
+namespace {
+
+// The control column and the widget widths below were tuned as constants
+// against the SDK's built-in 13 px font. An app that installs a larger UI font
+// through OnConfigureFonts pushes the longest cvar names past the column, and
+// the widgets end up drawn on top of the labels. Scaling by the live font size
+// keeps the layout proportional instead of pinning it to one font.
+constexpr float kTunedFontSize = 13.0f;
+
+float FontScale() { return std::max(1.0f, ImGui::GetFontSize() / kTunedFontSize); }
+
+float ControlColumnX() { return 240.0f * FontScale(); }
+
+}  // namespace
+
 SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path)
     : ImGuiDialog(imgui_drawer), config_path_(std::move(config_path)) {}
 
@@ -199,7 +214,8 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   const std::string search(search_buf_);
   const bool searching = !search.empty();
 
-  ImGui::SetNextWindowSize(ImVec2(620, 480), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(620.0f * FontScale(), 480.0f * FontScale()),
+                           ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowBgAlpha(0.85f);
   if (!ImGui::Begin("Settings##rex", nullptr, ImGuiWindowFlags_NoCollapse)) {
     ImGui::End();
@@ -214,7 +230,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
 
   ImGui::Separator();
 
-  const float panel_width = 160.0f;
+  const float panel_width = 160.0f * FontScale();
   ImGui::BeginChild("##cats", ImVec2(panel_width, -30.0f), true);
 
   // Recursive lambda to draw the category tree.
@@ -334,12 +350,12 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
 
       // Show description as label (e.g. "A button"), not the raw CVAR name
       ImGui::Text("%-20s", entry.description.c_str());
-      ImGui::SameLine(240.0f);
+      ImGui::SameLine(ControlColumnX());
 
       bool is_capturing = (capturing_bind_name_ == entry.name);
 
       if (is_capturing) {
-        ImGui::Button("Press any key...##v", ImVec2(140.0f, 0));
+        ImGui::Button("Press any key...##v", ImVec2(140.0f * FontScale(), 0));
 
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
           capturing_bind_name_.clear();
@@ -368,7 +384,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
           }
         }
       } else {
-        ImGui::SetNextItemWidth(80.0f);
+        ImGui::SetNextItemWidth(80.0f * FontScale());
         ImGui::Text("%-10s", current_val.c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton("Rebind##v")) {
@@ -429,9 +445,9 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
           ImGui::SetTooltip("[%s]", lifecycle_label);
         }
       }
-      ImGui::SameLine(240.0f);
+      ImGui::SameLine(ControlColumnX());
 
-      ImGui::SetNextItemWidth(160.0f);
+      ImGui::SetNextItemWidth(160.0f * FontScale());
       if (entry.type == rex::cvar::FlagType::Boolean) {
         bool v = rex::string::from_string<bool>(current_val, false);
         if (ImGui::Checkbox("##v", &v)) {

@@ -132,6 +132,8 @@ endif()
 
 if(REXGLUE_ENABLE_PERF_COUNTERS)
     target_sources(rexcore PRIVATE perf/counter.cpp)
-    target_compile_definitions(rexcore PUBLIC
-        $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
+    # Kept in Release too (LEGO Dimensions build, 2026-09-02): the counters are
+    # per-frame sets plus a few per-draw increments, and without them the F3
+    # overlay's FPS line and perf_log_csv are dead on the binary we actually run.
+    target_compile_definitions(rexcore PUBLIC REXGLUE_ENABLE_PERF_COUNTERS)
 endif()

@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <set>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -41,6 +42,22 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
                     "Read render-to-texture results on the CPU")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Ported from our xenia fork (the LEGO Dimensions readback cap). Games typically
+// read back only a small surface - a downsampled luminance target for HDR eye
+// adaptation, say - and never touch the full-screen resolves, so copying those
+// back to the CPU is wasted bandwidth AND it serialises the CPU on the GPU.
+// In xenia this single knob was the largest measured FPS win for this title.
+REXCVAR_DEFINE_UINT32(readback_resolve_max_kb, 0, "GPU/D3D12",
+                      "With readback resolves enabled, skip the CPU readback of any "
+                      "resolve larger than this many KB (0 = read back everything). "
+                      "The resolve itself still happens; only the copy to the CPU is "
+                      "skipped.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(readback_resolve_log_sizes, false, "GPU/D3D12",
+                    "Log the size of each distinct readback resolve once (to pick a "
+                    "readback_resolve_max_kb value for a title)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
@@ -2897,6 +2914,21 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     return true;
   }
 
+  // The resolve itself is already done at this point - everything below is
+  // purely the cost of getting a copy to the CPU, so bailing out here is
+  // exactly "no readback for this one resolve" and leaves the image alone.
+  if (REXCVAR_GET(readback_resolve_log_sizes)) {
+    static std::set<uint32_t> logged_sizes;
+    if (logged_sizes.size() < 64 && logged_sizes.insert(written_length).second) {
+      REXGPU_INFO("ResolveReadback: {} KB ({} bytes){}", written_length >> 10, written_length,
+                  texture_cache_->IsDrawResolutionScaled() ? ", scaled" : "");
+    }
+  }
+  uint32_t readback_max_kb = REXCVAR_GET(readback_resolve_max_kb);
+  if (readback_max_kb && uint64_t(written_length) > uint64_t(readback_max_kb) * 1024) {
+    return true;
+  }
+
   if (!memory_->TranslatePhysical(written_address)) {
     return true;
   }
@@ -3830,6 +3862,10 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     uint32_t texture_signs_mask = uint32_t(0b11111111) << texture_signs_shift;
     dirty |= (texture_signs_uint & texture_signs_mask) != texture_signs_shifted;
     texture_signs_uint = (texture_signs_uint & ~texture_signs_mask) | texture_signs_shifted;
+    uint32_t texture_integer_scale_bits = texture_cache_->GetActiveIntegerScaleBits(texture_index);
+    dirty |= system_constants_.texture_integer_scale_bits[texture_index] !=
+             texture_integer_scale_bits;
+    system_constants_.texture_integer_scale_bits[texture_index] = texture_integer_scale_bits;
     textures_resolution_scaled |=
         uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index)) << texture_index;
   }

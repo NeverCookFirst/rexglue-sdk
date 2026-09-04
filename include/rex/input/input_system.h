@@ -25,6 +25,8 @@ class Window;
 
 namespace rex::input {
 
+class Portal;
+
 class InputSystem : public system::IInputSystem {
  public:
   explicit InputSystem(rex::ui::Window* window);
@@ -47,6 +49,11 @@ class InputSystem : public system::IInputSystem {
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
 
+  /// Raw non-controller HID device (the emulated LEGO Dimensions ToyPad),
+  /// reached from XamInputNonControllerGetRaw/SetRaw. Null when absent.
+  Portal* GetPortal() const { return portal_.get(); }
+  void SetPortal(std::unique_ptr<Portal> portal);
+
  private:
   /// Re-enumerates every driver and notifies the assignment when the set
   /// changed.
@@ -60,6 +67,8 @@ class InputSystem : public system::IInputSystem {
 
   std::unique_ptr<DeviceAssignment> assignment_;
   ActiveDeviceTracker active_devices_;
+
+  std::unique_ptr<Portal> portal_;
 
   // Ordered by ordinal. Ordinals are never recycled, so unplugging pad one
   // does not renumber pad two.

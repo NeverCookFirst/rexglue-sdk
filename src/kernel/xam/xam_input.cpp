@@ -9,8 +9,12 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstring>
+
 #include <rex/input/input.h>
 #include <rex/input/input_system.h>
+#include <rex/input/portal/emulated_toypad.h>
+#include <rex/input/portal/portal.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
@@ -111,6 +115,16 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
     actual_user_index = 0;
   }
 
+  // While a toypad picker owns the pad, the game is told nothing is pressed. This
+  // is what puts the picker first: the button that opens it, and every button
+  // while it is open, acts only there and never reaches the game as well.
+  if (rex::input::EmulatedToypad::IsPickerInputActive()) {
+    if (input_state) {
+      std::memset(input_state.host_address(), 0, sizeof(X_INPUT_STATE));
+    }
+    return X_ERROR_SUCCESS;
+  }
+
   auto* is = input_system();
   return is->GetState(actual_user_index, input_state);
 }
@@ -195,6 +209,73 @@ i32 XamUserGetDeviceContext_entry(u32 user_index, u32 unk, mapped_u32 out_ptr) {
   }
 }
 
+// ============================================================================
+// Non-controller raw HID (the emulated LEGO Dimensions ToyPad).
+// Ported from the Xenia-Seamless-Toypad-Build fork; the device ids and the
+// X_ERROR_* return values are kept byte-for-byte identical to that build,
+// which is known to work in-game.
+// ============================================================================
+
+u32 XamInputNonControllerGetRawEx_entry(u32 device_id, mapped_u8 buffer_ptr,
+                                        mapped_u32 buffer_length_ptr, mapped_u16 state_ptr) {
+  if (device_id != 5 && device_id != 6) {
+    REXKRNL_WARN("XamInputNonControllerGetRawEx: rejected device_id={}", device_id);
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (!state_ptr || !buffer_length_ptr || !buffer_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  const uint32_t requested = *buffer_length_ptr;
+  if (requested == 0 || requested > rex::input::kPortalBufferSize) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  auto* portal = input_system()->GetPortal();
+  if (!portal) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
+  uint32_t bytes_read = requested;
+  uint16_t state = 0;
+
+  const auto result = portal->Read({buffer_ptr.host_address(), requested}, bytes_read, state);
+
+  if (XSUCCEEDED(result)) {
+    *buffer_length_ptr = bytes_read;
+    *state_ptr = state;
+  }
+  return result;
+}
+
+u32 XamInputNonControllerSetRawEx_entry(u32 device_id, mapped_u8 buffer_ptr, u32 buffer_length) {
+  if (device_id != 5 && device_id != 6) {
+    REXKRNL_WARN("XamInputNonControllerSetRawEx: rejected device_id={}", device_id);
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (!buffer_ptr || !buffer_length || buffer_length > rex::input::kPortalBufferSize) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  auto* portal = input_system()->GetPortal();
+  if (!portal) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
+  return portal->Write({buffer_ptr.host_address(), buffer_length});
+}
+
+u32 XamInputNonControllerGetRaw_entry(mapped_u16 state_ptr, mapped_u32 buffer_length_ptr,
+                                      mapped_u8 buffer_ptr) {
+  return XamInputNonControllerGetRawEx_entry(5, buffer_ptr, buffer_length_ptr, state_ptr);
+}
+
+u32 XamInputNonControllerSetRaw_entry(u32 buffer_length, mapped_u8 buffer_ptr) {
+  // Normally these are handled separately with a different first param, but
+  // whatever.
+  return XamInputNonControllerSetRawEx_entry(5, buffer_ptr, buffer_length);
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
@@ -218,10 +299,14 @@ REX_EXPORT_STUB(__imp__XamInputGetKeyLocks);
 REX_EXPORT_STUB(__imp__XamInputGetKeystrokeHud);
 REX_EXPORT_STUB(__imp__XamInputGetKeystrokeHudEx);
 REX_EXPORT_STUB(__imp__XamInputGetUserVibrationLevel);
-REX_EXPORT_STUB(__imp__XamInputNonControllerGetRaw);
-REX_EXPORT_STUB(__imp__XamInputNonControllerGetRawEx);
-REX_EXPORT_STUB(__imp__XamInputNonControllerSetRaw);
-REX_EXPORT_STUB(__imp__XamInputNonControllerSetRawEx);
+REX_EXPORT(__imp__XamInputNonControllerGetRaw,
+           rex::kernel::xam::XamInputNonControllerGetRaw_entry)
+REX_EXPORT(__imp__XamInputNonControllerGetRawEx,
+           rex::kernel::xam::XamInputNonControllerGetRawEx_entry)
+REX_EXPORT(__imp__XamInputNonControllerSetRaw,
+           rex::kernel::xam::XamInputNonControllerSetRaw_entry)
+REX_EXPORT(__imp__XamInputNonControllerSetRawEx,
+           rex::kernel::xam::XamInputNonControllerSetRawEx_entry)
 REX_EXPORT_STUB(__imp__XamInputRawState);
 REX_EXPORT_STUB(__imp__XamInputResetLayoutKeyboard);
 REX_EXPORT_STUB(__imp__XamInputSendStayAliveRequest);

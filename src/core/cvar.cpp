@@ -535,13 +535,53 @@ std::vector<std::string> ListModifiedFlags() {
   return result;
 }
 
+// TOML string quoting. A basic (double-quoted) string processes escapes, so a
+// Windows path like E:\Claude\LEGO is read as \C, \L, ... - invalid escapes
+// that fail the parse of the WHOLE file, silently dropping every setting in it.
+// That bit the LEGO Dimensions build twice on 2026-09-02: after a save from the
+// F4 overlay the game lost gpu_plugin and came up as a black fullscreen window.
+// A literal (single-quoted) string processes nothing, which is what paths want.
+// Fall back to a basic string only for values a literal string cannot hold (one
+// containing a single quote or a newline), escaping those properly.
+static std::string QuoteTomlString(const std::string& value) {
+  if (value.find('\'') == std::string::npos && value.find('\n') == std::string::npos &&
+      value.find('\r') == std::string::npos) {
+    return "'" + value + "'";
+  }
+  std::string out = "\"";
+  for (char c : value) {
+    switch (c) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out += c;
+        break;
+    }
+  }
+  out += '"';
+  return out;
+}
+
 std::string SerializeToTOML() {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
   for (const auto& entry : GetRegistryStorage()) {
     if (entry.getter() != entry.default_value) {
       if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + entry.getter() + "\"\n";
+        result += entry.name + " = " + QuoteTomlString(entry.getter()) + "\n";
       } else {
         result += entry.name + " = " + entry.getter() + "\n";
       }
@@ -556,7 +596,7 @@ std::string SerializeToTOML(std::string_view category) {
   for (const auto& entry : GetRegistryStorage()) {
     if (entry.category == category && entry.getter() != entry.default_value) {
       if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + entry.getter() + "\"\n";
+        result += entry.name + " = " + QuoteTomlString(entry.getter()) + "\n";
       } else {
         result += entry.name + " = " + entry.getter() + "\n";
       }

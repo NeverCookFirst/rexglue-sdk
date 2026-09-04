@@ -100,9 +100,11 @@ if(REXGLUE_ENABLE_TRACY)
         $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
 endif()
 
+# Perf counters stay on in Release (LEGO build 2026-09-02): the F3 FPS line and
+# perf_log_csv live in the plugin/exe, which only see this target's INTERFACE.
 if(REXGLUE_ENABLE_PERF_COUNTERS)
     target_compile_definitions(rexruntime PUBLIC
-        $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
+        REXGLUE_ENABLE_PERF_COUNTERS)
 endif()
 
 if(WIN32)

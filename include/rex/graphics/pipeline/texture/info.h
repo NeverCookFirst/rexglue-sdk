@@ -126,6 +126,13 @@ struct FormatInfo {
   uint32_t block_width;
   uint32_t block_height;
   uint32_t bits_per_pixel;
+  // Stored width of each component, in bits, before any host expansion; 0 for
+  // formats with no fixed-point components. Ported from xenia-canary d1195052,
+  // which needs these to compute the integer fetch scale on the CPU.
+  uint8_t component_bits[4];
+  // Whether the components are fixed-point (so an integer num_format fetch has
+  // a guest integer range that the normalized host sample has to be scaled to).
+  bool fixed;
 
   uint32_t bytes_per_block() const { return block_width * block_height * bits_per_pixel / 8; }
 

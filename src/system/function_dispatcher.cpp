@@ -17,11 +17,21 @@
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
+#include <mutex>
+#include <unordered_set>
+
+#include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/ppc/context.h>
 #include <rex/runtime.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
+
+REXCVAR_DEFINE_BOOL(invalid_function_nonfatal, false, "Runtime",
+                    "Log calls to unregistered guest functions and keep running instead of "
+                    "aborting. Debug aid for collecting every missing address in one session; "
+                    "skipping a real function can corrupt guest state, so leave it off to play.");
 
 namespace rex::runtime {
 
@@ -35,8 +45,26 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 }  // namespace
 
 static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
-  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
-            ctx.last_indirect_target);
+  const uint32_t address = ctx.last_indirect_target;
+
+  if (!REXCVAR_GET(invalid_function_nonfatal)) {
+    REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}", address);
+  }
+
+  // Debug aid: report the address and return, so one play session can surface
+  // every missing function instead of dying at the first one. Each address is
+  // logged once - these are hit from tight loops and would drown the log.
+  static std::mutex seen_mutex;
+  static std::unordered_set<uint32_t> seen_addresses;
+  bool first_time;
+  {
+    std::lock_guard<std::mutex> lock(seen_mutex);
+    first_time = seen_addresses.insert(address).second;
+  }
+  if (first_time) {
+    REXSYS_ERROR("MISSING-FUNCTION 0x{:08X} (skipped; guest state may be corrupt from here)",
+                 address);
+  }
 }
 
 PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {

@@ -53,15 +53,9 @@ class EmulatedToypad final : public Portal {
   void OnDeviceArrival() override {}
   void OnDeviceRemoval() override {}
 
-  // True while a toypad picker is open - either the companion app's, watched
-  // through its named event, or one hosted inside this process. Guest input is
-  // withheld while it is: the picker gets every button first, so opening it does
-  // not also act in the game.
+  // True while the companion app's picker overlay is open; gamepad input
+  // should not reach the game.
   static bool IsPickerInputActive();
-
-  // Claims or releases the pad for a picker running inside this process. Kept
-  // apart from the companion app's flag so neither clears the other.
-  static void SetInProcessPickerActive(bool active);
 
   // Listener-driven state changes (called from the listener thread).
   uint32_t LoadFigure(const std::array<uint8_t, kToypadTagSize>& buf, std::string file_path,

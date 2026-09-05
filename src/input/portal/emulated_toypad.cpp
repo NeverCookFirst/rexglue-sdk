@@ -63,10 +63,7 @@ constexpr auto kMovePickupDelay = std::chrono::milliseconds(500);
 constexpr wchar_t kPickerEventName[] = L"Local\\CemuToypadPickerInputActive";
 #endif
 
-// The companion app's picker, watched through its named event.
 std::atomic<bool> s_picker_active{false};
-// A picker hosted inside this process. Either one claims the pad.
-std::atomic<bool> s_in_process_picker_active{false};
 
 constexpr std::array<uint8_t, 16> kCommandKey = {0x55, 0xFE, 0xF6, 0xB0, 0x62, 0xBF, 0x0B, 0x41,
                                                  0xC9, 0xB3, 0x7C, 0xB4, 0x97, 0x3E, 0x29, 0x7B};
@@ -180,17 +177,7 @@ EmulatedToypad::~EmulatedToypad() {
 #endif
 }
 
-bool EmulatedToypad::IsPickerInputActive() {
-  return s_picker_active.load() || s_in_process_picker_active.load();
-}
-
-void EmulatedToypad::SetInProcessPickerActive(bool active) {
-  const bool was = s_in_process_picker_active.exchange(active);
-  if (was != active) {
-    REXLOG_INFO("Toypad: in-process picker {} - game input {}", active ? "opened" : "closed",
-                active ? "blocked" : "released");
-  }
-}
+bool EmulatedToypad::IsPickerInputActive() { return s_picker_active.load(); }
 
 // ============================================================================
 // Guest-facing read/write (XamInputNonControllerGetRawEx/SetRawEx)

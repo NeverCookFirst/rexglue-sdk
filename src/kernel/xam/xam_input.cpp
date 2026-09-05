@@ -9,11 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <cstring>
-
 #include <rex/input/input.h>
 #include <rex/input/input_system.h>
-#include <rex/input/portal/emulated_toypad.h>
 #include <rex/input/portal/portal.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -113,16 +110,6 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
   if ((actual_user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) {
     // Always pin user to 0.
     actual_user_index = 0;
-  }
-
-  // While a toypad picker owns the pad, the game is told nothing is pressed. This
-  // is what puts the picker first: the button that opens it, and every button
-  // while it is open, acts only there and never reaches the game as well.
-  if (rex::input::EmulatedToypad::IsPickerInputActive()) {
-    if (input_state) {
-      std::memset(input_state.host_address(), 0, sizeof(X_INPUT_STATE));
-    }
-    return X_ERROR_SUCCESS;
   }
 
   auto* is = input_system();

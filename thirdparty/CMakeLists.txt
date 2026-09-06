@@ -44,6 +44,10 @@ set(REQUIRED_SUBMODULES
     sdl3
 )
 
+if(WIN32)
+    list(APPEND REQUIRED_SUBMODULES libusb)
+endif()
+
 if(REXGLUE_USE_VULKAN)
     list(APPEND REQUIRED_SUBMODULES
         vulkan-headers vulkan-memory-allocator
@@ -702,3 +706,31 @@ set_target_properties(libavutil libavcodec PROPERTIES
     C_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
     FOLDER "FFmpeg")
+
+#=============================================================================
+# libusb - USB passthrough for physical toy portals (Windows only)
+#
+# Source list mirrors the Windows build of libusb's own Makefile; the library
+# ships no CMake of its own. msvc/ holds the config.h that stands in for the
+# autotools-generated one.
+#=============================================================================
+if(WIN32)
+    add_library(libusb STATIC
+        libusb/libusb/core.c
+        libusb/libusb/descriptor.c
+        libusb/libusb/hotplug.c
+        libusb/libusb/io.c
+        libusb/libusb/strerror.c
+        libusb/libusb/sync.c
+        libusb/libusb/os/events_windows.c
+        libusb/libusb/os/threads_windows.c
+        libusb/libusb/os/windows_common.c
+        libusb/libusb/os/windows_usbdk.c
+        libusb/libusb/os/windows_winusb.c
+    )
+    target_include_directories(libusb
+        PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/libusb/libusb>
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libusb/msvc)
+    target_compile_options(libusb PRIVATE -w)
+    set_target_properties(libusb PROPERTIES FOLDER "thirdparty")
+endif()

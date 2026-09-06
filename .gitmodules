@@ -66,3 +66,6 @@
 [submodule "thirdparty/tracy"]
 	path = thirdparty/tracy
 	url = https://github.com/wolfpld/tracy.git
+[submodule "thirdparty/libusb"]
+	path = thirdparty/libusb
+	url = https://github.com/libusb/libusb.git

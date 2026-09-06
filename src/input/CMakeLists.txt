@@ -32,13 +32,15 @@ target_include_directories(rexinput PUBLIC
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 if(WIN32)
-    target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp xinput/xinput_input_driver.cpp)
+    target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp xinput/xinput_input_driver.cpp
+                                    portal/hardware_portal.cpp)
 else()
     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp)
 endif()
 
 target_link_libraries(rexinput PUBLIC rexcore rexui SDL3::SDL3)
 if(WIN32)
-    # Loopback listener in portal/emulated_toypad.cpp.
-    target_link_libraries(rexinput PUBLIC ws2_32)
+    # Loopback listener in portal/emulated_toypad.cpp; libusb for the
+    # physical portal passthrough in portal/hardware_portal.cpp.
+    target_link_libraries(rexinput PUBLIC ws2_32 PRIVATE libusb)
 endif()

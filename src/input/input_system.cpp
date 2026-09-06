@@ -20,6 +20,7 @@
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
 #include <rex/input/portal/emulated_toypad.h>
+#include <rex/input/portal/hardware_portal.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/input/state_merge.h>
 #include <rex/input/xinput/xinput_input_driver.h>
@@ -29,6 +30,11 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+
+REXCVAR_DEFINE_BOOL(toypad_emulation, true, "Input",
+                    "Emulate the LEGO Dimensions ToyPad (with the companion-app listener) "
+                    "instead of passing through a physical portal over USB")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 namespace rex::input {
 
 namespace {
@@ -351,9 +357,15 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
       input->AddDriver(std::move(mnk_driver));
     }
 
-    // Emulated LEGO Dimensions ToyPad. Only outside tool mode: it starts a
-    // loopback listener thread, which codegen has no use for.
-    input->SetPortal(std::make_unique<EmulatedToypad>());
+    // LEGO Dimensions ToyPad. Only outside tool mode: the emulated one starts
+    // a loopback listener thread, which codegen has no use for.
+    if (REXCVAR_GET(toypad_emulation)) {
+      REXLOG_INFO("Portal: using the emulated ToyPad.");
+      input->SetPortal(std::make_unique<EmulatedToypad>());
+    } else {
+      REXLOG_INFO("Portal: using a physical portal over USB.");
+      input->SetPortal(std::make_unique<HardwarePortal>());
+    }
   }
 
   // NOP driver (primary in tool mode, fallback otherwise)

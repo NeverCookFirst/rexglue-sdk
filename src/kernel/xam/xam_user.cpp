@@ -270,6 +270,11 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     }
     out_setting->setting_id = setting_id;
 
+    if (setting && setting->is_title_specific()) {
+      REXKRNL_INFO("XamUserReadProfileSettings: title setting {:08X} {}", setting_id,
+                   setting->is_set ? fmt::format("set, {} bytes", setting->size) : "not set");
+    }
+
     if (setting && setting->is_set) {
       setting->Append(&out_setting->data, &out_stream);
     }
@@ -328,6 +333,15 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
     if (setting_type == UserProfile::Setting::Type::UNSET) {
       continue;
     }
+    if (setting.data.type > static_cast<uint8_t>(UserProfile::Setting::Type::DATETIME)) {
+      // LEGO Dimensions never fills data.type: the record arrives with stack
+      // garbage there and only setting_id, size and pointer set. The real XAM
+      // evidently trusts the type encoded in the setting id (its top nibble),
+      // so fall back to that.
+      UserProfile::Setting::Key key;
+      key.value = setting.setting_id;
+      setting_type = static_cast<UserProfile::Setting::Type>(key.type);
+    }
 
     REXKRNL_DEBUG(
         "XamUserWriteProfileSettings: setting index [{}]:"
@@ -358,7 +372,18 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
       case UserProfile::Setting::Type::INT64:
       case UserProfile::Setting::Type::DATETIME:
       default: {
-        REXKRNL_ERROR("XamUserWriteProfileSettings: Unimplemented data type {}", setting_type);
+        // Dump the whole record: LEGO Dimensions hands us type 0x70 for its
+        // title-specific settings, and the layout has to be understood before
+        // anything can be persisted.
+        std::string hex;
+        const uint8_t* raw = reinterpret_cast<const uint8_t*>(&setting);
+        for (size_t i = 0; i < sizeof(X_USER_PROFILE_SETTING); ++i) {
+          hex += fmt::format("{:02X}{}", raw[i], (i % 4 == 3) ? " " : "");
+        }
+        REXKRNL_ERROR(
+            "XamUserWriteProfileSettings: Unimplemented data type {} (setting_id={:08X} from={} "
+            "record={})",
+            setting_type, (uint32_t)setting.setting_id, (uint32_t)setting.from, hex);
       } break;
     };
   }

@@ -666,19 +666,22 @@ void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
   if (auto imGuiKey = VirtualKeyToImGuiKey(virtual_key); imGuiKey) {
     io.AddKeyEvent(*imGuiKey, is_down);
   }
+  // A modifier lives in its own key slot, separate from the physical Left/Right
+  // key, and only an explicit event fills it. Writing io.KeyCtrl and friends
+  // does nothing: ImGui overwrites those from that slot every frame, so without
+  // this every shortcut it owns is dead - paste, copy, cut, select all.
   switch (virtual_key) {
     case VirtualKey::kShift:
-      io.KeyShift = is_down;
+      io.AddKeyEvent(ImGuiMod_Shift, is_down);
       break;
     case VirtualKey::kControl:
-      io.KeyCtrl = is_down;
+      io.AddKeyEvent(ImGuiMod_Ctrl, is_down);
       break;
     case VirtualKey::kMenu:
-      // FIXME(Triang3l): Doesn't work in xenia-ui-window-demo.
-      io.KeyAlt = is_down;
+      io.AddKeyEvent(ImGuiMod_Alt, is_down);
       break;
     case VirtualKey::kLWin:
-      io.KeySuper = is_down;
+      io.AddKeyEvent(ImGuiMod_Super, is_down);
       break;
     default:
       break;

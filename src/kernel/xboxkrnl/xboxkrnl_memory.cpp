@@ -60,8 +60,53 @@ uint32_t FromXdkProtectFlags(uint32_t protect) {
   return result;
 }
 
+// How much of the guest's address space is spoken for. A title that slowly
+// stops loading things - no full moveset, no vehicles, no new figures - is
+// either running out of memory or has stopped asking for it, and one line a
+// minute is enough to tell those two apart after the fact. Off unless asked
+// for, since a healthy run has nothing to say.
+REXCVAR_DEFINE_INT32(log_guest_memory_interval, 0, "Log",
+                     "Seconds between guest memory reports (0 = off)");
+
+static void ReportGuestMemory(bool force) {
+  const int32_t interval = REXCVAR_GET(log_guest_memory_interval);
+  if (!force && interval <= 0) {
+    return;
+  }
+  using clock = std::chrono::steady_clock;
+  static std::atomic<int64_t> last_report{0};
+  const int64_t now =
+      std::chrono::duration_cast<std::chrono::seconds>(clock::now().time_since_epoch()).count();
+  if (!force) {
+    int64_t previous = last_report.load(std::memory_order_relaxed);
+    if (previous != 0 && now - previous < interval) {
+      return;
+    }
+    if (!last_report.compare_exchange_strong(previous, now, std::memory_order_relaxed)) {
+      return;
+    }
+  }
+
+  auto* memory = REX_KERNEL_MEMORY();
+  auto describe = [memory](bool physical, uint32_t page_size) {
+    auto* heap = memory->LookupHeapByType(physical, page_size);
+    if (!heap) {
+      return std::string("n/a");
+    }
+    const uint32_t total = heap->total_page_count();
+    const uint32_t used = total - heap->unreserved_page_count();
+    return fmt::format("{}/{} pages ({} MB)", used, total,
+                       (uint64_t(used) * page_size) / (1024 * 1024));
+  };
+  REXKRNL_INFO("Guest memory: virtual 4K {}, virtual 64K {}, physical 64K {}",
+               describe(false, 4 * 1024), describe(false, 64 * 1024), describe(true, 64 * 1024));
+}
+
 u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_size_ptr,
                                   u32 alloc_type, u32 protect_bits, u32 debug_memory) {
+  // Every allocation passes through here, so this is the cheapest timer there
+  // is: no extra thread, and it only reports while the title is still asking.
+  ReportGuestMemory(false);
   uint32_t input_base = base_addr_ptr ? static_cast<uint32_t>(*base_addr_ptr) : 0;
   uint32_t input_size = region_size_ptr ? static_cast<uint32_t>(*region_size_ptr) : 0;
   REXKRNL_IMPORT_TRACE(
@@ -172,7 +217,11 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
     heap->Alloc(adjusted_size, page_size, allocation_type, protect, top_down, &address);
   }
   if (!address) {
-    // Failed - assume no memory available.
+    // Failed - assume no memory available. Always worth a line: this is the
+    // moment a title starts failing to load things.
+    REXKRNL_WARN("NtAllocateVirtualMemory: out of guest memory for {:#x} bytes (type={:#x})",
+                 adjusted_size, (uint32_t)alloc_type);
+    ReportGuestMemory(true);
     return X_STATUS_NO_MEMORY;
   }
 

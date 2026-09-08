@@ -100,6 +100,11 @@ class EmulatedToypad final : public Portal {
 
   void PushResponse(std::array<uint8_t, 32> frame);
 
+  // The colour the game last set on a pad. Kept so the companion app can show
+  // the pads the way the game lit them; the game never reads it back.
+  void RecordPadColour(uint8_t pad, const uint8_t* rgb);
+  std::array<uint8_t, 9> PadColours();
+
   // Listener.
   void ListenerRun(uint16_t port);
   void HandleClient(uintptr_t client_socket);
@@ -108,6 +113,8 @@ class EmulatedToypad final : public Portal {
   std::mutex state_lock_;
   std::array<ToypadFigure, kToypadFigureCount> figures_{};
   std::queue<std::array<uint8_t, 32>> responses_;
+  // RGB per pad, in pad order (1 centre, 2 left, 3 right).
+  std::array<uint8_t, 9> pad_colours_{};
 
   uint32_t random_a_ = 0;
   uint32_t random_b_ = 0;

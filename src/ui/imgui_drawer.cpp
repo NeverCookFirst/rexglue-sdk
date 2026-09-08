@@ -163,6 +163,51 @@ void ImGuiDrawer::Initialize() {
   platform_io.Platform_SetImeDataFn = PlatformSetImeData;
   platform_io.Platform_ImeUserData = this;
 
+#if REX_PLATFORM_WIN32
+  // Without these, ImGui keeps its own private clipboard: copy and paste work
+  // between two of its own text fields and nowhere else, so a path copied from
+  // Explorer cannot be pasted into a settings field.
+  platform_io.Platform_GetClipboardTextFn = [](ImGuiContext*) -> const char* {
+    static std::string text;
+    text.clear();
+    if (!::OpenClipboard(nullptr)) {
+      return text.c_str();
+    }
+    if (HANDLE handle = ::GetClipboardData(CF_UNICODETEXT)) {
+      if (auto* wide = static_cast<const wchar_t*>(::GlobalLock(handle))) {
+        const int needed =
+            ::WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+        if (needed > 1) {
+          text.resize(static_cast<size_t>(needed) - 1);
+          ::WideCharToMultiByte(CP_UTF8, 0, wide, -1, text.data(), needed, nullptr, nullptr);
+        }
+        ::GlobalUnlock(handle);
+      }
+    }
+    ::CloseClipboard();
+    return text.c_str();
+  };
+  platform_io.Platform_SetClipboardTextFn = [](ImGuiContext*, const char* text) {
+    if (!text || !::OpenClipboard(nullptr)) {
+      return;
+    }
+    ::EmptyClipboard();
+    const int needed = ::MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
+    if (needed > 0) {
+      if (HANDLE handle = ::GlobalAlloc(GMEM_MOVEABLE, size_t(needed) * sizeof(wchar_t))) {
+        if (auto* wide = static_cast<wchar_t*>(::GlobalLock(handle))) {
+          ::MultiByteToWideChar(CP_UTF8, 0, text, -1, wide, needed);
+          ::GlobalUnlock(handle);
+          ::SetClipboardData(CF_UNICODETEXT, handle);
+        } else {
+          ::GlobalFree(handle);
+        }
+      }
+    }
+    ::CloseClipboard();
+  };
+#endif
+
   // TODO(gibbed): disable imgui.ini saving for now,
   // imgui assumes paths are char* so we can't throw a good path at it on
   // Windows.

@@ -103,6 +103,18 @@ std::string ToHex(const uint8_t* data, size_t size) {
   return out;
 }
 
+bool SendAll(socket_t s, const uint8_t* data, size_t len) {
+  while (len != 0) {
+    const auto sent = ::send(s, reinterpret_cast<const char*>(data), static_cast<int>(len), 0);
+    if (sent <= 0) {
+      return false;
+    }
+    data += sent;
+    len -= static_cast<size_t>(sent);
+  }
+  return true;
+}
+
 bool RecvAll(socket_t s, uint8_t* data, size_t len) {
   while (len != 0) {
     const auto received = ::recv(s, reinterpret_cast<char*>(data), static_cast<int>(len), 0);
@@ -276,14 +288,58 @@ void EmulatedToypad::HandleCommand(const uint8_t* buf, size_t buf_size) {
       GetChallengeResponse(&buf[4], sequence, result);
       break;
     }
-    case 0xC0:    // Color
+    // The pad lights. The game never reads these back, but the companion app
+    // asks for them so it can show the pads the way the game lit them, so the
+    // colour each command ends on is recorded. The payload layouts below are
+    // the ones the game actually sends, read off captured frames; each per-pad
+    // group ends with its RGB triplet, which is the only part worth keeping.
+    case 0xC0: {  // Color: pad, R, G, B
+      RecordPadColour(buf[4], &buf[5]);
+      GetBlankResponse(0x01, sequence, result);
+      break;
+    }
+    case 0xC2: {  // Fade: pad, time, count, R, G, B
+      RecordPadColour(buf[4], &buf[7]);
+      GetBlankResponse(0x01, sequence, result);
+      break;
+    }
+    case 0xC3: {  // Flash: pad, on, off, count, R, G, B
+      RecordPadColour(buf[4], &buf[8]);
+      GetBlankResponse(0x01, sequence, result);
+      break;
+    }
+    case 0xC8: {  // Color All: 3 x (enabled, R, G, B)
+      for (uint8_t pad = 1; pad <= 3; ++pad) {
+        const uint8_t* group = &buf[4] + (pad - 1) * 4;
+        if (group[0]) {
+          RecordPadColour(pad, &group[1]);
+        }
+      }
+      GetBlankResponse(0x01, sequence, result);
+      break;
+    }
+    case 0xC6: {  // Fade All: 3 x (enabled, time, count, R, G, B)
+      for (uint8_t pad = 1; pad <= 3; ++pad) {
+        const uint8_t* group = &buf[4] + (pad - 1) * 6;
+        if (group[0]) {
+          RecordPadColour(pad, &group[3]);
+        }
+      }
+      GetBlankResponse(0x01, sequence, result);
+      break;
+    }
+    case 0xC7: {  // Flash All: 3 x (enabled, on, off, count, R, G, B)
+      for (uint8_t pad = 1; pad <= 3; ++pad) {
+        const uint8_t* group = &buf[4] + (pad - 1) * 7;
+        if (group[0]) {
+          RecordPadColour(pad, &group[4]);
+        }
+      }
+      GetBlankResponse(0x01, sequence, result);
+      break;
+    }
     case 0xC1:    // Get Pad Color
-    case 0xC2:    // Fade
-    case 0xC3:    // Flash
-    case 0xC4:    // Fade Random
-    case 0xC6:    // Fade All
-    case 0xC7:    // Flash All
-    case 0xC8: {  // Color All
+    case 0xC4: {  // Fade Random
       GetBlankResponse(0x01, sequence, result);
       break;
     }
@@ -305,6 +361,19 @@ void EmulatedToypad::HandleCommand(const uint8_t* buf, size_t buf_size) {
     }
   }
   PushResponse(result);
+}
+
+void EmulatedToypad::RecordPadColour(uint8_t pad, const uint8_t* rgb) {
+  if (pad < 1 || pad > 3) {
+    return;
+  }
+  std::lock_guard<std::mutex> guard(state_lock_);
+  std::copy_n(rgb, 3, pad_colours_.begin() + (pad - 1) * 3);
+}
+
+std::array<uint8_t, 9> EmulatedToypad::PadColours() {
+  std::lock_guard<std::mutex> guard(state_lock_);
+  return pad_colours_;
 }
 
 void EmulatedToypad::PushResponse(std::array<uint8_t, 32> frame) {
@@ -685,6 +754,16 @@ void EmulatedToypad::HandleClient(uintptr_t client_socket) {
   const uint8_t cmd = header[0];
   const uint8_t pad = header[1];
   const uint8_t index = header[2];
+
+  // The colour query carries no pad or figure, so it has to be answered before
+  // the checks the placement commands need. The companion app polls it many
+  // times a second: failing it here left the app showing stale pad colours and
+  // buried the log in rejections.
+  if (cmd == 0x04) {
+    const std::array<uint8_t, 9> colours = PadColours();
+    SendAll(client, colours.data(), colours.size());
+    return;
+  }
 
   if (pad < 1 || pad > 3 || index >= kToypadFigureCount) {
     REXLOG_WARN("Toypad listener: rejected message cmd={:02X} pad={} index={}", cmd, pad, index);

@@ -39,10 +39,54 @@ REXCVAR_DEFINE_BOOL(vulkan_prefer_vertex_pipeline_stores_and_atomics, true, "UI/
 REXCVAR_DEFINE_BOOL(vulkan_prefer_fill_mode_non_solid, true, "UI/Vulkan",
                     "Prefer physical devices supporting fillModeNonSolid when auto-selecting")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(vulkan_prefer_discrete_gpu, true, "UI/Vulkan",
+                    "Prefer a discrete GPU over an integrated one when auto-selecting")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
 namespace ui {
 namespace vulkan {
+
+namespace {
+
+// Ranks a physical device for auto-selection: higher wins. Laptops and APU
+// desktops enumerate the integrated GPU first as often as not, and every
+// feature the preference cvars above look at is supported by both, so without
+// this the game happily starts on the iGPU - the single most common cause of a
+// bad first-run frame rate.
+uint32_t PhysicalDeviceTypeRank(VkPhysicalDeviceType type) {
+  switch (type) {
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+      return 4;
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+      return 3;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+      return 2;
+    case VK_PHYSICAL_DEVICE_TYPE_OTHER:
+      return 1;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU:
+    default:
+      return 0;
+  }
+}
+
+const char* PhysicalDeviceTypeName(VkPhysicalDeviceType type) {
+  switch (type) {
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+      return "discrete";
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+      return "integrated";
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+      return "virtual";
+    case VK_PHYSICAL_DEVICE_TYPE_CPU:
+      return "cpu";
+    default:
+      return "other";
+  }
+}
+
+}  // namespace
+
 
 std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emulation,
                                                        const bool with_presentation) {
@@ -72,7 +116,8 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
     VkPhysicalDeviceProperties physical_device_properties;
     ifn.vkGetPhysicalDeviceProperties(physical_devices[physical_device_index],
                                       &physical_device_properties);
-    REXLOG_WARN("* {}: {}", physical_device_index, physical_device_properties.deviceName);
+    REXLOG_WARN("* {}: {} ({})", physical_device_index, physical_device_properties.deviceName,
+                PhysicalDeviceTypeName(physical_device_properties.deviceType));
   }
 
   if (REXCVAR_GET(vulkan_device) >= 0 &&
@@ -88,40 +133,58 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
     bool prefer_fragment_stores = REXCVAR_GET(vulkan_prefer_fragment_stores_and_atomics);
     bool prefer_vertex_stores = REXCVAR_GET(vulkan_prefer_vertex_pipeline_stores_and_atomics);
     bool prefer_fill_mode_non_solid = REXCVAR_GET(vulkan_prefer_fill_mode_non_solid);
+    bool prefer_discrete_gpu = REXCVAR_GET(vulkan_prefer_discrete_gpu);
     if (with_gpu_emulation && physical_devices.size() > 1 &&
-        (prefer_geometry_shader || prefer_fragment_stores || prefer_vertex_stores ||
-         prefer_fill_mode_non_solid)) {
+        (prefer_discrete_gpu || prefer_geometry_shader || prefer_fragment_stores ||
+         prefer_vertex_stores || prefer_fill_mode_non_solid)) {
       struct PhysicalDeviceScore {
         VkPhysicalDevice physical_device;
-        uint32_t score;
+        // Ordered lexicographically: the device type outranks every feature
+        // preference, because an integrated GPU that ticks all four feature
+        // boxes is still the wrong device to run the game on.
+        uint32_t type_rank;
+        uint32_t feature_score;
       };
       std::vector<PhysicalDeviceScore> scored_devices;
       scored_devices.reserve(physical_devices.size());
       for (const VkPhysicalDevice physical_device : physical_devices) {
         VkPhysicalDeviceFeatures supported_features = {};
         ifn.vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
-        uint32_t score = 0;
+        uint32_t feature_score = 0;
         if (prefer_geometry_shader && supported_features.geometryShader) {
-          ++score;
+          ++feature_score;
         }
         if (prefer_fragment_stores && supported_features.fragmentStoresAndAtomics) {
-          ++score;
+          ++feature_score;
         }
         if (prefer_vertex_stores && supported_features.vertexPipelineStoresAndAtomics) {
-          ++score;
+          ++feature_score;
         }
         if (prefer_fill_mode_non_solid && supported_features.fillModeNonSolid) {
-          ++score;
+          ++feature_score;
         }
-        scored_devices.push_back({physical_device, score});
+        uint32_t type_rank = 0;
+        if (prefer_discrete_gpu) {
+          VkPhysicalDeviceProperties properties;
+          ifn.vkGetPhysicalDeviceProperties(physical_device, &properties);
+          type_rank = PhysicalDeviceTypeRank(properties.deviceType);
+        }
+        scored_devices.push_back({physical_device, type_rank, feature_score});
       }
 
       std::stable_sort(scored_devices.begin(), scored_devices.end(),
                        [](const PhysicalDeviceScore& a, const PhysicalDeviceScore& b) {
-                         return a.score > b.score;
+                         if (a.type_rank != b.type_rank) {
+                           return a.type_rank > b.type_rank;
+                         }
+                         return a.feature_score > b.feature_score;
                        });
 
-      if (!scored_devices.empty() && scored_devices.front().score != scored_devices.back().score) {
+      const bool order_differs =
+          !scored_devices.empty() &&
+          (scored_devices.front().type_rank != scored_devices.back().type_rank ||
+           scored_devices.front().feature_score != scored_devices.back().feature_score);
+      if (order_differs) {
         physical_devices_ordered.clear();
         physical_devices_ordered.reserve(scored_devices.size());
         for (const PhysicalDeviceScore& scored_device : scored_devices) {
@@ -143,6 +206,24 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
           "Couldn't choose a compatible Vulkan physical device or initialize a "
           "Vulkan logical device");
       return nullptr;
+    }
+  }
+
+  {
+    // Say out loud which device won. When a player reports a bad frame rate,
+    // this one line answers "is it running on the iGPU?" without a back and
+    // forth.
+    VkPhysicalDeviceProperties chosen_properties;
+    ifn.vkGetPhysicalDeviceProperties(provider->vulkan_device_->physical_device(),
+                                      &chosen_properties);
+    REXLOG_INFO("Vulkan device selected: {} ({})", chosen_properties.deviceName,
+                PhysicalDeviceTypeName(chosen_properties.deviceType));
+    if (chosen_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU &&
+        physical_devices.size() > 1) {
+      REXLOG_WARN(
+          "Running on an integrated GPU with other devices present - expect a poor "
+          "frame rate. Set the 'vulkan_device' configuration variable to the index "
+          "of your dedicated GPU listed above, or force it in the driver control panel.");
     }
   }
 

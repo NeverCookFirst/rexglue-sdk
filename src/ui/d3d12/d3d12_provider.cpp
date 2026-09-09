@@ -253,7 +253,37 @@ bool D3D12Provider::Initialize() {
   // Choose the adapter.
   uint32_t adapter_index = 0;
   IDXGIAdapter1* adapter = nullptr;
-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
+
+  // In auto mode, ask DXGI for the adapters in high-performance order before
+  // falling back to raw enumeration order. On laptops and APU desktops
+  // EnumAdapters1 often hands back the integrated GPU first, and the game runs
+  // at a fraction of the frame rate it should until the player adds a manual
+  // exception in the driver control panel. An explicit d3d12_adapter index and
+  // the WARP request (-2) keep the old path.
+  if (REXCVAR_GET(d3d12_adapter) == -1) {
+    Microsoft::WRL::ComPtr<IDXGIFactory6> dxgi_factory6;
+    if (SUCCEEDED(dxgi_factory->QueryInterface(IID_PPV_ARGS(&dxgi_factory6)))) {
+      uint32_t preferred_index = 0;
+      IDXGIAdapter1* preferred_adapter = nullptr;
+      while (dxgi_factory6->EnumAdapterByGpuPreference(
+                 preferred_index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                 IID_PPV_ARGS(&preferred_adapter)) == S_OK) {
+        DXGI_ADAPTER_DESC1 preferred_desc;
+        if (SUCCEEDED(preferred_adapter->GetDesc1(&preferred_desc)) &&
+            !(preferred_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            SUCCEEDED(pfn_d3d12_create_device_(preferred_adapter, D3D_FEATURE_LEVEL_11_0,
+                                               _uuidof(ID3D12Device), nullptr))) {
+          adapter = preferred_adapter;
+          break;
+        }
+        preferred_adapter->Release();
+        preferred_adapter = nullptr;
+        ++preferred_index;
+      }
+    }
+  }
+
+  while (adapter == nullptr && dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
     DXGI_ADAPTER_DESC1 adapter_desc;
     if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
       if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
@@ -298,9 +328,23 @@ bool D3D12Provider::Initialize() {
     char* adapter_name_mb = reinterpret_cast<char*>(alloca(adapter_name_mb_size));
     if (WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1, adapter_name_mb,
                             adapter_name_mb_size, nullptr, nullptr) != 0) {
-      REXGPU_INFO("DXGI adapter: {} (vendor 0x{:04X}, device 0x{:04X})", adapter_name_mb,
-                  adapter_desc.VendorId, adapter_desc.DeviceId);
+      REXGPU_INFO("DXGI adapter: {} (vendor 0x{:04X}, device 0x{:04X}, {} MB dedicated)",
+                  adapter_name_mb, adapter_desc.VendorId, adapter_desc.DeviceId,
+                  uint64_t(adapter_desc.DedicatedVideoMemory) / (1024 * 1024));
     }
+  }
+
+  // DXGI has no "this is the integrated GPU" flag, but an integrated one has no
+  // dedicated video memory to speak of - it carves out of system RAM. Saying so
+  // in the log answers "is it running on the iGPU?" the moment a player reports
+  // a bad frame rate, instead of costing a round trip.
+  if (adapter_desc.DedicatedVideoMemory < (uint64_t(512) * 1024 * 1024)) {
+    REXLOG_WARN(
+        "The chosen GPU reports almost no dedicated video memory, which usually means "
+        "it is an integrated GPU - expect a poor frame rate. If this machine has a "
+        "dedicated GPU, set the game to 'High performance' in the driver control panel "
+        "or in Windows graphics settings, or set the 'd3d12_adapter' configuration "
+        "variable to its index.");
   }
 
   // Create the Direct3D 12 device.

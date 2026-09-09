@@ -16,6 +16,7 @@
 #include <rex/ui/keybinds.h>
 #include <imgui.h>
 
+#include <cstring>
 #include <algorithm>
 #include <map>
 #include <set>
@@ -305,6 +306,13 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
            (cat.size() > 15 && cat.compare(0, 15, "Input/Keybinds/") == 0);
   };
 
+  // A keybind category may also hold a setting that is not itself a bind, such
+  // as which player the keyboard is. Those are told apart by name, so they get
+  // an ordinary widget instead of a Rebind button.
+  auto is_bind_entry = [](const std::string& name) -> bool {
+    return name.rfind("keybind_", 0) == 0 || name.rfind("bind_", 0) == 0;
+  };
+
   ImGui::BeginChild("##cvars", ImVec2(0, -30.0f), false);
   for (auto& entry : registry) {
     // Filter by category (unless searching).
@@ -341,12 +349,13 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
     const char* display_label =
         (!entry.description.empty()) ? entry.description.c_str() : entry.name.c_str();
 
-    if (is_keybind_category(entry.category)) {
-      // Grey out controller keybinds when MnK mode is disabled
-      bool mnk_disabled =
+    if (is_keybind_category(entry.category) && is_bind_entry(entry.name)) {
+      // Controller binds stay editable with MnK mode off, so the layout can be
+      // set up before switching it on. Only the row is dimmed as a hint.
+      bool mnk_off =
           (entry.category == "Input/Keybinds/Controller" && !REXCVAR_QUERY(bool, mnk_mode));
-      if (mnk_disabled)
-        ImGui::BeginDisabled();
+      if (mnk_off)
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.6f);
 
       // Show description as label (e.g. "A button"), not the raw CVAR name
       ImGui::Text("%-20s", entry.description.c_str());
@@ -385,7 +394,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
         }
       } else {
         ImGui::SetNextItemWidth(80.0f * FontScale());
-        ImGui::Text("%-10s", current_val.c_str());
+        ImGui::Text("%-10s", current_val.empty() ? "(none)" : current_val.c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton("Rebind##v")) {
           capturing_bind_name_ = entry.name;
@@ -394,14 +403,34 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
         if (ImGui::SmallButton("Reset##v")) {
           rex::cvar::SetFlagByName(entry.name, entry.default_value);
         }
+        ImGui::SameLine();
+        // An empty bind never matches, which is how an action is turned off.
+        if (ImGui::SmallButton("Clear##v")) {
+          rex::cvar::SetFlagByName(entry.name, "");
+        }
       }
 
       // Conflict detection
       if (!current_val.empty()) {
         int conflict_count = 0;
+        // The D-pad deliberately shares the left stick's keys by default, so
+        // that pair is not reported as a clash.
+        auto direction_twins = [](const std::string& a, const std::string& b) {
+          auto dir = [](const std::string& n) -> std::string {
+            for (const char* p : {"keybind_dpad_", "keybind_lstick_"}) {
+              size_t len = std::strlen(p);
+              if (n.compare(0, len, p) == 0)
+                return n.substr(len);
+            }
+            return std::string();
+          };
+          std::string da = dir(a);
+          return !da.empty() && da == dir(b);
+        };
         for (auto& other : registry) {
-          if (is_keybind_category(other.category) && other.name != entry.name &&
-              other.getter() == current_val) {
+          if (is_keybind_category(other.category) && is_bind_entry(other.name) &&
+              other.name != entry.name &&
+              other.getter() == current_val && !direction_twins(entry.name, other.name)) {
             conflict_count++;
           }
         }
@@ -416,8 +445,8 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
       }
 
       // Skip the generic name + lifecycle badge rendering for keybinds
-      if (mnk_disabled)
-        ImGui::EndDisabled();
+      if (mnk_off)
+        ImGui::PopStyleVar();
       if (read_only)
         ImGui::EndDisabled();
       ImGui::PopID();

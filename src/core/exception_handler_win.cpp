@@ -16,7 +16,10 @@
 #include "platform_win.h"
 
 #include <rex/assert.h>
+#include <rex/logging.h>
 #include <rex/math.h>
+
+#include <cstdio>
 
 namespace rex::arch {
 
@@ -101,9 +104,71 @@ LONG CALLBACK ExceptionHandlerCallback(PEXCEPTION_POINTERS ex_info) {
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
+namespace {
+
+// Windows kills the process the moment an exception reaches the end of the
+// handler chain, and it does so without touching our log - which is why a
+// crash inside recompiled game code leaves game.log ending mid-sentence, with
+// no clue as to where it died. This filter is the last thing to run before
+// that happens: it writes the exception and the faulting address to the log,
+// flushes, and drops a minidump next to the executable so the stack can be
+// read afterwards in a debugger.
+LONG WINAPI LastChanceExceptionFilter(PEXCEPTION_POINTERS ex_info) {
+  const EXCEPTION_RECORD* record = ex_info->ExceptionRecord;
+  REXLOG_CRITICAL("[FATAL] Unhandled exception 0x{:08X} at host 0x{:016X}",
+                  static_cast<uint32_t>(record->ExceptionCode),
+                  reinterpret_cast<uint64_t>(record->ExceptionAddress));
+  if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+      record->NumberParameters >= 2) {
+    REXLOG_CRITICAL("[FATAL] Access violation: {} of 0x{:016X}",
+                    record->ExceptionInformation[0] ? "write" : "read",
+                    static_cast<uint64_t>(record->ExceptionInformation[1]));
+  }
+  if (auto logger = ::rex::GetLogger()) {
+    logger->flush();
+  }
+
+  // dbghelp is loaded on demand so the runtime keeps no link-time dependency
+  // on it; if it is missing, the log lines above are still written.
+  using PFNMiniDumpWriteDump = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int,
+                                             void*, void*, void*);
+  if (HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll")) {
+    auto write_dump = reinterpret_cast<PFNMiniDumpWriteDump>(
+        GetProcAddress(dbghelp, "MiniDumpWriteDump"));
+    if (write_dump) {
+      wchar_t path[MAX_PATH];
+      _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"crash-%lu.dmp",
+                   GetCurrentProcessId());
+      HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+      if (file != INVALID_HANDLE_VALUE) {
+        struct {
+          DWORD thread_id;
+          PEXCEPTION_POINTERS exception_pointers;
+          BOOL client_pointers;
+        } dump_info = {GetCurrentThreadId(), ex_info, FALSE};
+        // 2 = MiniDumpWithFullMemory: large, but a stack alone rarely explains
+        // a crash in recompiled code.
+        write_dump(GetCurrentProcess(), GetCurrentProcessId(), file, 2,
+                   &dump_info, nullptr, nullptr);
+        CloseHandle(file);
+        REXLOG_CRITICAL("[FATAL] Minidump written to crash-{}.dmp",
+                        static_cast<uint32_t>(GetCurrentProcessId()));
+        if (auto logger = ::rex::GetLogger()) {
+          logger->flush();
+        }
+      }
+    }
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+}  // namespace
+
 void ExceptionHandler::Install(Handler fn, void* data) {
   if (!veh_handle_) {
     veh_handle_ = AddVectoredExceptionHandler(1, ExceptionHandlerCallback);
+    SetUnhandledExceptionFilter(LastChanceExceptionFilter);
 
     if (IsDebuggerPresent()) {
       // TODO(benvanik): do we need a continue handler if a debugger is

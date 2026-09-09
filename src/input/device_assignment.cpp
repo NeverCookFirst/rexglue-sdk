@@ -22,7 +22,10 @@ void SlotAssignment::OnDevicesChanged(const std::vector<DeviceInfo>& devices) {
   // not promote pad two to player one.
   for (const auto& device : devices) {
     if (device.synthetic) {
-      users_[0].push_back(device.id);
+      // The keyboard says which player it is, so it can sit in slot two while a
+      // real pad holds slot one.
+      uint32_t user = device.preferred_user < kMaxGuestUsers ? device.preferred_user : 0;
+      users_[user].push_back(device.id);
     } else if (device.ordinal < kMaxGuestUsers) {
       users_[device.ordinal].push_back(device.id);
     }

@@ -28,6 +28,9 @@ struct DeviceInfo {
   std::string name;
   std::string guid;
   bool synthetic = false;  // keyboard/mouse emulation or the NOP stand-in
+  // Guest user a synthetic device asks to be assigned to. Physical pads take
+  // their user from connection order instead, so this is ignored for them.
+  uint32_t preferred_user = 0;
 };
 
 }  // namespace rex::input

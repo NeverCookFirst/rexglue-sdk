@@ -110,6 +110,13 @@ void InputSystem::RefreshDevices() {
                                  [&](const DeviceInfo& d) { return d.id == seen[i].id; });
     if (existing != devices_.end()) {
       seen[i].ordinal = existing->ordinal;
+      // A synthetic device can move between guest users while it stays
+      // connected - the keyboard does, when its player is switched - and that
+      // has to reach the assignment or the change would not take until
+      // something was plugged in.
+      if (seen[i].preferred_user != existing->preferred_user) {
+        changed = true;
+      }
       continue;
     }
     fresh[i] = true;

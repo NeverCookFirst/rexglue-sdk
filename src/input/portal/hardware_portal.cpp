@@ -14,6 +14,9 @@
 
 #include <libusb.h>
 
+#include <algorithm>
+#include <cstring>
+
 #include <rex/logging.h>
 
 namespace rex::input {
@@ -40,6 +43,53 @@ HardwarePortal::~HardwarePortal() {
 
 bool HardwarePortal::IsConnected() { return handle_ != nullptr; }
 
+bool HardwarePortal::FindEndpoints(libusb_device_handle* handle) {
+  read_endpoint_ = 0;
+  write_endpoint_ = 0;
+  interface_number_ = 0;
+
+  libusb_config_descriptor* config = nullptr;
+  if (libusb_get_active_config_descriptor(libusb_get_device(handle), &config) !=
+      LIBUSB_SUCCESS) {
+    return false;
+  }
+
+  for (uint8_t i = 0; i < config->bNumInterfaces && !read_endpoint_; i++) {
+    const libusb_interface& iface = config->interface[i];
+    for (int a = 0; a < iface.num_altsetting; a++) {
+      const libusb_interface_descriptor& alt = iface.altsetting[a];
+      uint8_t in = 0, out = 0;
+      for (uint8_t e = 0; e < alt.bNumEndpoints; e++) {
+        const libusb_endpoint_descriptor& ep = alt.endpoint[e];
+        if ((ep.bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) !=
+            LIBUSB_TRANSFER_TYPE_INTERRUPT) {
+          continue;
+        }
+        if (ep.bEndpointAddress & LIBUSB_ENDPOINT_IN) {
+          if (!in) in = ep.bEndpointAddress;
+        } else if (!out) {
+          out = ep.bEndpointAddress;
+        }
+      }
+      if (in && out) {
+        read_endpoint_ = in;
+        write_endpoint_ = out;
+        interface_number_ = alt.bInterfaceNumber;
+        break;
+      }
+    }
+  }
+
+  libusb_free_config_descriptor(config);
+  if (!read_endpoint_) {
+    return false;
+  }
+
+  REXLOG_INFO("Portal: interface {}, interrupt endpoints in 0x{:02X} out 0x{:02X}",
+              interface_number_, read_endpoint_, write_endpoint_);
+  return true;
+}
+
 void HardwarePortal::OpenDevice() {
   if (!context_ || handle_) {
     return;
@@ -57,7 +107,14 @@ void HardwarePortal::OpenDevice() {
     // a platform with a kernel HID driver bound to the portal.
     libusb_set_auto_detach_kernel_driver(handle, 1);
 
-    const int claim_result = libusb_claim_interface(handle, 0);
+    if (!FindEndpoints(handle)) {
+      REXLOG_ERROR("Portal: {} ({:04X}:{:04X}) exposes no interrupt endpoint pair.",
+                   entry.name, entry.vendor_id, entry.product_id);
+      libusb_close(handle);
+      continue;
+    }
+
+    const int claim_result = libusb_claim_interface(handle, interface_number_);
     if (claim_result != LIBUSB_SUCCESS) {
       // Almost always the stock HID driver still owning the interface; the
       // fix is installing libusb/WinUSB over it with Zadig.
@@ -87,10 +144,12 @@ void HardwarePortal::CloseDevice() {
     return;
   }
 
-  libusb_release_interface(handle_, 0);
+  libusb_release_interface(handle_, interface_number_);
   libusb_close(handle_);
   handle_ = nullptr;
   device_name_ = nullptr;
+  read_endpoint_ = 0;
+  write_endpoint_ = 0;
 }
 
 X_STATUS HardwarePortal::ReadInternal(std::span<uint8_t> data,
@@ -99,8 +158,9 @@ X_STATUS HardwarePortal::ReadInternal(std::span<uint8_t> data,
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  std::array<uint8_t, kPortalBufferSize> frame{};
   const int result = libusb_interrupt_transfer(
-      handle_, kReadEndpoint, data.data(), static_cast<int>(data.size()),
+      handle_, read_endpoint_, frame.data(), static_cast<int>(frame.size()),
       &read_count, kTimeoutMs);
 
   switch (result) {
@@ -122,6 +182,21 @@ X_STATUS HardwarePortal::ReadInternal(std::span<uint8_t> data,
     return X_ERROR_FUNCTION_FAILED;
   }
 
+  // Hand the guest the frame back in the shape it writes in. Length is the
+  // header's payload count plus the type, length and checksum bytes.
+  std::array<uint8_t, kPortalBufferSize> out{};
+  if (frame_offset_ > 0) {
+    const size_t len = std::min<size_t>(size_t(frame[1]) + 3, out.size());
+    out[0] = frame_prefix_byte_;
+    out[1] = static_cast<uint8_t>(len);
+    std::memcpy(&out[2], frame.data(), std::min(len, out.size() - 2));
+  } else {
+    out = frame;
+  }
+
+  const size_t count = std::min(out.size(), data.size());
+  std::memcpy(data.data(), out.data(), count);
+  read_count = static_cast<int32_t>(count);
   return X_ERROR_SUCCESS;
 }
 
@@ -130,8 +205,33 @@ X_STATUS HardwarePortal::WriteInternal(std::span<uint8_t> data) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  // Find the 0x55 command frame. The Xbox 360 transport prepends a short
+  // wrapper (0x0B <len> ...) that the portal itself knows nothing about, so
+  // send it what it speaks and remember the wrapper for the reply.
+  size_t offset = 0;
+  const size_t scan_limit = std::min<size_t>(4, data.size());
+  for (; offset < scan_limit; offset++) {
+    if (data[offset] == 0x55) {
+      break;
+    }
+  }
+  if (offset == scan_limit) {
+    REXLOG_WARN("Portal[Write] no 0x55 frame found; dropping it");
+    return X_ERROR_SUCCESS;
+  }
+  if (frame_offset_ != static_cast<int>(offset)) {
+    frame_offset_ = static_cast<int>(offset);
+    frame_prefix_byte_ = offset > 0 ? data[0] : 0;
+    REXLOG_INFO("Portal: guest frame offset {} (prefix {:02X})", offset,
+                frame_prefix_byte_);
+  }
+
+  std::array<uint8_t, kPortalBufferSize> frame{};
+  std::memcpy(frame.data(), data.data() + offset,
+              std::min(data.size() - offset, frame.size()));
+
   const int result = libusb_interrupt_transfer(
-      handle_, kWriteEndpoint, data.data(), static_cast<int>(data.size()),
+      handle_, write_endpoint_, frame.data(), static_cast<int>(frame.size()),
       nullptr, kTimeoutMs);
 
   if (result == LIBUSB_ERROR_NO_DEVICE) {

@@ -306,6 +306,20 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
     return;
   }
 
+  // The label already exists in this function's body, so the goto is valid by
+  // construction - emit it without asking classifyTarget.
+  //
+  // classifyTarget only trusts an address that lands inside a recorded block,
+  // while the label collection walks the function linearly. Where the compiler
+  // left out-of-line code in a gap between blocks, a branch into it classified
+  // as Unknown and became a REX_FATAL even though the target label sits a few
+  // lines above in the same body. That is what killed the game on the ropes:
+  // four branches to loc_839AAE20 inside sub_839AACC0.
+  if (fn.isLabel(target)) {
+    println("\tif ({}{}.{}) goto loc_{:08X};", not_ ? "!" : "", cr(insn.operands[0]), cond, target);
+    return;
+  }
+
   // Use classifyTarget for consistent branch classification
   // false = branch instruction (not a call), so own-base means loop back
   auto kind = graph().classifyTarget(target, base, false);
@@ -342,16 +356,16 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
       } else {
         REXCODEGEN_ERROR("Unresolved conditional branch to 0x{:08X} from 0x{:08X} (no CallTarget)",
                          target, base);
-        println("\tif ({}{}.{}) REX_FATAL(\"Unresolved branch from 0x{:08X} to 0x{:08X}\");",
-                not_ ? "!" : "", cr(insn.operands[0]), cond, base, target);
+        println("\tif ({}{}.{}) REX_FATAL(\"Unresolved branch from 0x{:08X} to 0x{:08X} in sub_{:08X}\");",
+                not_ ? "!" : "", cr(insn.operands[0]), cond, base, target, fn.base());
       }
       break;
 
     case TargetKind::Unknown:
       REXCODEGEN_ERROR("Unresolved conditional branch to 0x{:08X} from 0x{:08X}", target, base);
       println("\t// ERROR: conditional branch to unknown address 0x{:08X}", target);
-      println("\tif ({}{}.{}) REX_FATAL(\"Unresolved branch from 0x{:08X} to 0x{:08X}\");",
-              not_ ? "!" : "", cr(insn.operands[0]), cond, base, target);
+      println("\tif ({}{}.{}) REX_FATAL(\"Unresolved branch from 0x{:08X} to 0x{:08X} in sub_{:08X}\");",
+              not_ ? "!" : "", cr(insn.operands[0]), cond, base, target, fn.base());
       break;
   }
 }

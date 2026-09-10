@@ -530,10 +530,32 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
           entry.command_callback("");
         }
       } else {
-        char buf[256];
-        rex::string::copy_truncating(buf, current_val, sizeof(buf));
-        if (ImGui::InputText("##v", buf, sizeof(buf), ImGuiInputTextFlags_EnterReturnsTrue)) {
+        // Refilling the buffer from the cvar every frame undid each keystroke,
+        // so a path could never be typed over: ImGui reloads its edit state
+        // when the caller's buffer changes underneath it. The field being
+        // edited keeps its own buffer instead, and the cvar is written when the
+        // field is left or Enter is pressed - not on every character, which
+        // would apply half-typed paths.
+        const bool editing = (editing_text_name_ == entry.name);
+        char local_buf[sizeof(text_buf_)];
+        char* buf = text_buf_;
+        if (!editing) {
+          buf = local_buf;
+          rex::string::copy_truncating(local_buf, current_val, sizeof(local_buf));
+        }
+        if (ImGui::InputText("##v", buf, sizeof(text_buf_),
+                             ImGuiInputTextFlags_EnterReturnsTrue)) {
           rex::cvar::SetFlagByName(entry.name, buf);
+        }
+        if (ImGui::IsItemActivated()) {
+          rex::string::copy_truncating(text_buf_, current_val, sizeof(text_buf_));
+          editing_text_name_ = entry.name;
+        } else if (editing && ImGui::IsItemDeactivated()) {
+          // Escape reverts the text before deactivating, so this writes back
+          // what was already there and the setting is unchanged, which is what
+          // Escape should do.
+          rex::cvar::SetFlagByName(entry.name, text_buf_);
+          editing_text_name_.clear();
         }
       }
     }

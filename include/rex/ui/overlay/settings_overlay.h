@@ -30,6 +30,10 @@ class SettingsDialog : public ImGuiDialog {
   char search_buf_[128] = {};
   std::string selected_category_;
   std::string capturing_bind_name_;
+  // The string cvar currently being typed into, and its buffer. Kept across
+  // frames so the text is not refilled from the cvar while it is being edited.
+  std::string editing_text_name_;
+  char text_buf_[512] = {};
 };
 
 }  // namespace rex::ui

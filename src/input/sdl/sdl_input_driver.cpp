@@ -140,9 +140,17 @@ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
   }
 }
 
-void SDLInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {}
+// Focus loss is reported as the controller going inactive rather than by
+// clearing the cache: GetState already neutralises an inactive pad, and going
+// through it keeps a button that was held down still held when focus returns,
+// instead of delivering a phantom release.
+void SDLInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
+  has_focus_.store(false, std::memory_order_relaxed);
+}
 
-void SDLInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {}
+void SDLInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {
+  has_focus_.store(true, std::memory_order_relaxed);
+}
 
 void SDLInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
   // Polling can start before the window exists and the subsystems are up.
@@ -194,7 +202,9 @@ X_RESULT SDLInputDriver::GetDeviceCapabilities(DeviceId id, uint32_t flags,
 X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   assert(sdl_events_initialized_ && SDL_Gamepad_initialized_);
 
-  auto is_active = this->is_active();
+  // Unfocused counts as inactive: SDL stops sending events, so the cache is
+  // stale rather than neutral.
+  auto is_active = this->is_active() && has_focus_.load(std::memory_order_relaxed);
 
   if (is_active) {
     QueueControllerUpdate();
@@ -298,7 +308,9 @@ X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
       rex::ui::VirtualKey::kXInputPadRThumbDownLeft,
   };
 
-  auto is_active = this->is_active();
+  // Unfocused counts as inactive: SDL stops sending events, so the cache is
+  // stale rather than neutral.
+  auto is_active = this->is_active() && has_focus_.load(std::memory_order_relaxed);
 
   if (is_active) {
     QueueControllerUpdate();

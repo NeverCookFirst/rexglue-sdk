@@ -90,6 +90,14 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void UpdateXCapabilities(ControllerState& state);
   void QueueControllerUpdate();
 
+  // SDL delivers no gamepad events while the window is unfocused, so the
+  // cached controller state simply stops advancing - it does not go neutral.
+  // Without this the game keeps reading whatever the sticks last reported and
+  // the character walks on by itself, which reads to a player as the pad
+  // having disconnected. Starts true: the first focus event may arrive well
+  // after the driver does.
+  std::atomic<bool> has_focus_{true};
+
   rex::ui::Window* attached_window_ = nullptr;
   bool sdl_events_initialized_;
   bool SDL_Gamepad_initialized_;

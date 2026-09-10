@@ -22,6 +22,16 @@
 
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+// Defined in ui/overlay/console_commands.cpp. Runs one guest-function call
+// queued by the console's "call" command, on this thread, or returns
+// immediately when nothing is queued.
+//
+// Declared by hand instead of through a header because a header the game
+// executable also includes would force the executable to be relinked, and the
+// point of keeping these commands in the SDK is that a change to them costs
+// only a rexruntime.dll rebuild.
+extern "C" void RexConsoleDrainPendingGuestCall();
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -94,6 +104,10 @@ u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetstate(v=vs.85).aspx
 u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> input_state) {
+  // Run anything the console's "call" command has queued. See the declaration
+  // above for why it lives here.
+  RexConsoleDrainPendingGuestCall();
+
   // Games call this with a NULL state ptr, probably as a query.
   static int call_count = 0;
   if (++call_count <= 5) {

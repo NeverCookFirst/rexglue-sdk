@@ -56,6 +56,27 @@ void CloseSock(socket_t s) { ::close(s); }
 
 constexpr auto kMovePickupDelay = std::chrono::milliseconds(500);
 
+// How long a connection may sit silent before the listener drops it. The
+// companion app polls the pad colours several times a second and reconnects
+// on its own, so this only ever fires on a client that has gone away without
+// closing - and it is what stops such a client leaking a thread and a socket.
+constexpr int kClientIdleTimeoutMs = 60000;
+
+// A blocking recv with no deadline is how one silent client used to wedge the
+// whole listener; every accepted socket gets one.
+void SetRecvTimeout(socket_t s, int milliseconds) {
+#ifdef _WIN32
+  const DWORD timeout = static_cast<DWORD>(milliseconds);
+  ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout),
+               sizeof(timeout));
+#else
+  timeval timeout{};
+  timeout.tv_sec = milliseconds / 1000;
+  timeout.tv_usec = (milliseconds % 1000) * 1000;
+  ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+#endif
+}
+
 // Companion-app input handoff (same cross-repo contract as the Cemu and
 // RPCS3 forks): LegoToypad keeps this manual-reset event signaled while its
 // picker overlay is visible.
@@ -293,46 +314,52 @@ void EmulatedToypad::HandleCommand(const uint8_t* buf, size_t buf_size) {
     // colour each command ends on is recorded. The payload layouts below are
     // the ones the game actually sends, read off captured frames; each per-pad
     // group ends with its RGB triplet, which is the only part worth keeping.
+    // Pad 0 addresses all three at once, which is how the game lights them on
+    // connect and, far more often, how it turns them all off again.
     case 0xC0: {  // Color: pad, R, G, B
-      RecordPadColour(buf[4], &buf[5]);
+      RecordPadLed(buf[4], static_cast<uint8_t>(ToypadLedMode::Solid), &buf[5], 0, 0, 0, 0);
       GetBlankResponse(0x01, sequence, result);
       break;
     }
     case 0xC2: {  // Fade: pad, time, count, R, G, B
-      RecordPadColour(buf[4], &buf[7]);
+      RecordPadLed(buf[4], static_cast<uint8_t>(ToypadLedMode::Fade), &buf[7], 0, 0, buf[6],
+                   buf[5]);
       GetBlankResponse(0x01, sequence, result);
       break;
     }
     case 0xC3: {  // Flash: pad, on, off, count, R, G, B
-      RecordPadColour(buf[4], &buf[8]);
+      RecordPadLed(buf[4], static_cast<uint8_t>(ToypadLedMode::Flash), &buf[8], buf[5], buf[6],
+                   buf[7], 0);
       GetBlankResponse(0x01, sequence, result);
       break;
     }
     case 0xC8: {  // Color All: 3 x (enabled, R, G, B)
-      for (uint8_t pad = 1; pad <= 3; ++pad) {
+      for (uint8_t pad = 1; pad <= kLedRegionCount; ++pad) {
         const uint8_t* group = &buf[4] + (pad - 1) * 4;
         if (group[0]) {
-          RecordPadColour(pad, &group[1]);
+          RecordPadLed(pad, static_cast<uint8_t>(ToypadLedMode::Solid), &group[1], 0, 0, 0, 0);
         }
       }
       GetBlankResponse(0x01, sequence, result);
       break;
     }
     case 0xC6: {  // Fade All: 3 x (enabled, time, count, R, G, B)
-      for (uint8_t pad = 1; pad <= 3; ++pad) {
+      for (uint8_t pad = 1; pad <= kLedRegionCount; ++pad) {
         const uint8_t* group = &buf[4] + (pad - 1) * 6;
         if (group[0]) {
-          RecordPadColour(pad, &group[3]);
+          RecordPadLed(pad, static_cast<uint8_t>(ToypadLedMode::Fade), &group[3], 0, 0, group[2],
+                       group[1]);
         }
       }
       GetBlankResponse(0x01, sequence, result);
       break;
     }
     case 0xC7: {  // Flash All: 3 x (enabled, on, off, count, R, G, B)
-      for (uint8_t pad = 1; pad <= 3; ++pad) {
+      for (uint8_t pad = 1; pad <= kLedRegionCount; ++pad) {
         const uint8_t* group = &buf[4] + (pad - 1) * 7;
         if (group[0]) {
-          RecordPadColour(pad, &group[4]);
+          RecordPadLed(pad, static_cast<uint8_t>(ToypadLedMode::Flash), &group[4], group[1],
+                       group[2], group[3], 0);
         }
       }
       GetBlankResponse(0x01, sequence, result);
@@ -363,17 +390,94 @@ void EmulatedToypad::HandleCommand(const uint8_t* buf, size_t buf_size) {
   PushResponse(result);
 }
 
-void EmulatedToypad::RecordPadColour(uint8_t pad, const uint8_t* rgb) {
-  if (pad < 1 || pad > 3) {
+void EmulatedToypad::RecordPadLed(uint8_t pad, uint8_t mode, const uint8_t* rgb, uint8_t on_ticks,
+                                  uint8_t off_ticks, uint8_t count, uint8_t speed_ticks) {
+  // Pad 0 addresses all three at once, and the game leans on it: it is how the
+  // pads are lit white on connect and, more often, how they are all turned off
+  // again. Dropping it as an invalid pad meant every such command was ignored
+  // and the companion app kept showing whatever colour happened to be there
+  // last - most visibly, pads that never went dark.
+  if (pad > kLedRegionCount) {
     return;
   }
-  std::lock_guard<std::mutex> guard(state_lock_);
-  std::copy_n(rgb, 3, pad_colours_.begin() + (pad - 1) * 3);
+
+  // A solid colour of pure black is the pad being switched off, and saying so
+  // in the mode is what lets the app stop drawing a glow rather than draw a
+  // black one.
+  if (mode == static_cast<uint8_t>(ToypadLedMode::Solid) && rgb[0] == 0 && rgb[1] == 0 &&
+      rgb[2] == 0) {
+    mode = static_cast<uint8_t>(ToypadLedMode::Off);
+  }
+
+  bool changed = false;
+  {
+    std::lock_guard<std::mutex> guard(state_lock_);
+    const size_t first = pad == 0 ? 0 : pad - 1u;
+    const size_t last = pad == 0 ? pad_leds_.size() : first + 1;
+    for (size_t i = first; i < last; ++i) {
+      PadLed next;
+      next.mode = mode;
+      next.r = rgb[0];
+      next.g = rgb[1];
+      next.b = rgb[2];
+      // The colour standing on the pad when this command landed.
+      next.from_r = pad_leds_[i].r;
+      next.from_g = pad_leds_[i].g;
+      next.from_b = pad_leds_[i].b;
+      next.on_ticks = on_ticks;
+      next.off_ticks = off_ticks;
+      next.count = count;
+      next.speed_ticks = speed_ticks;
+
+      const PadLed& current = pad_leds_[i];
+      if (current.mode == next.mode && current.r == next.r && current.g == next.g &&
+          current.b == next.b && current.on_ticks == next.on_ticks &&
+          current.off_ticks == next.off_ticks && current.count == next.count &&
+          current.speed_ticks == next.speed_ticks) {
+        continue;  // the game repeats a standing command constantly
+      }
+      pad_leds_[i] = next;
+      changed = true;
+    }
+    if (changed) {
+      ++led_serial_;
+    }
+  }
+
+  // Only on a change, so a game that repaints the same colour every frame does
+  // not drown the log. This is the line to look for when the companion app
+  // shows the wrong colour: it says what the game actually asked for.
+  if (changed) {
+    REXLOG_INFO("Toypad: pad {} mode {} lit {:02X} {:02X} {:02X} (on {} off {} count {} speed {})",
+                pad, mode, rgb[0], rgb[1], rgb[2], on_ticks, off_ticks, count, speed_ticks);
+  }
 }
 
-std::array<uint8_t, 9> EmulatedToypad::PadColours() {
+std::array<uint8_t, kLedSnapshotSize> EmulatedToypad::LedSnapshot() {
+  std::array<uint8_t, kLedSnapshotSize> out{};
+  out[0] = kLedMagic;
+  out[2] = kLedProtocolVersion;
+  out[3] = kLedRegionCount;
+
   std::lock_guard<std::mutex> guard(state_lock_);
-  return pad_colours_;
+  out[1] = led_serial_;
+  for (size_t i = 0; i < pad_leds_.size(); ++i) {
+    const PadLed& led = pad_leds_[i];
+    uint8_t* region = out.data() + 4 + i * kLedRegionStride;
+    region[0] = static_cast<uint8_t>(i + 1);  // 1 centre, 2 left, 3 right
+    region[1] = led.mode;
+    region[2] = led.r;
+    region[3] = led.g;
+    region[4] = led.b;
+    region[5] = led.from_r;
+    region[6] = led.from_g;
+    region[7] = led.from_b;
+    region[8] = led.on_ticks;
+    region[9] = led.off_ticks;
+    region[10] = led.count;
+    region[11] = led.speed_ticks;
+  }
+  return out;
 }
 
 void EmulatedToypad::PushResponse(std::array<uint8_t, 32> frame) {
@@ -743,13 +847,39 @@ bool EmulatedToypad::MoveFigure(uint8_t pad, uint8_t index, uint8_t old_pad, uin
 // Companion-app TCP listener (wire contract shared with the Cemu/RPCS3 forks)
 // ============================================================================
 
+// Keeping a connection open is for the colour poll and nothing else. A client
+// that sends a placement command and then waits for the server to hang up -
+// which is what the Windows companion app does - would otherwise sit there
+// until its own timeout, and every place, move and remove would feel slow.
+// So LOAD, REMOVE and MOVE close the connection the moment they are done,
+// exactly as they did before, and only GET_LED stays on the line.
 void EmulatedToypad::HandleClient(uintptr_t client_socket) {
+  while (listener_running_.load() && HandleCommand(client_socket)) {
+  }
+  CloseSock(static_cast<socket_t>(client_socket));
+  ForgetClient(client_socket);
+  client_count_.fetch_sub(1);
+}
+
+void EmulatedToypad::ForgetClient(uintptr_t client_socket) {
+  std::lock_guard<std::mutex> guard(clients_lock_);
+  const auto it = std::find(client_sockets_.begin(), client_sockets_.end(), client_socket);
+  if (it != client_sockets_.end()) {
+    client_sockets_.erase(it);
+  }
+}
+
+bool EmulatedToypad::HandleCommand(uintptr_t client_socket) {
   const socket_t client = static_cast<socket_t>(client_socket);
 
   uint8_t header[5];
   if (!RecvAll(client, header, sizeof(header))) {
-    return;
+    return false;
   }
+
+  // Commands still run one at a time, in arrival order, exactly as they did
+  // when the accept loop handled them inline.
+  std::lock_guard<std::mutex> serialise(command_lock_);
 
   const uint8_t cmd = header[0];
   const uint8_t pad = header[1];
@@ -760,26 +890,27 @@ void EmulatedToypad::HandleClient(uintptr_t client_socket) {
   // times a second: failing it here left the app showing stale pad colours and
   // buried the log in rejections.
   if (cmd == 0x04) {
-    const std::array<uint8_t, 9> colours = PadColours();
-    SendAll(client, colours.data(), colours.size());
-    return;
+    const std::array<uint8_t, kLedSnapshotSize> snapshot = LedSnapshot();
+    return SendAll(client, snapshot.data(), snapshot.size());
   }
 
+  // A rejected command closes the connection: for LOAD its tag and path are
+  // still on the wire, and there is no way to resynchronise a stream cleanly.
   if (pad < 1 || pad > 3 || index >= kToypadFigureCount) {
     REXLOG_WARN("Toypad listener: rejected message cmd={:02X} pad={} index={}", cmd, pad, index);
-    return;
+    return false;
   }
 
   switch (cmd) {
     case 0x01: {  // LOAD
       std::array<uint8_t, kToypadTagSize> tag{};
       if (!RecvAll(client, tag.data(), tag.size())) {
-        return;
+        return false;
       }
 
       uint8_t len_buf[2];
       if (!RecvAll(client, len_buf, sizeof(len_buf))) {
-        return;
+        return false;
       }
       const uint16_t path_len = static_cast<uint16_t>(len_buf[0] | (len_buf[1] << 8));
 
@@ -787,7 +918,7 @@ void EmulatedToypad::HandleClient(uintptr_t client_socket) {
       if (path_len != 0) {
         std::vector<uint8_t> path_buf(path_len);
         if (!RecvAll(client, path_buf.data(), path_len)) {
-          return;
+          return false;
         }
         path.assign(reinterpret_cast<const char*>(path_buf.data()), path_len);
       }
@@ -809,13 +940,13 @@ void EmulatedToypad::HandleClient(uintptr_t client_socket) {
       const uint8_t old_index = header[4];
       if (old_pad < 1 || old_pad > 3 || old_index >= kToypadFigureCount) {
         REXLOG_WARN("Toypad listener: rejected MOVE source pad={} index={}", old_pad, old_index);
-        return;
+        return false;
       }
 
       if (!TempRemove(old_index)) {
         REXLOG_WARN("Toypad listener: ignored MOVE from empty slot pad={} index={}", old_pad,
                     old_index);
-        return;
+        return false;
       }
 
       std::this_thread::sleep_for(kMovePickupDelay);
@@ -828,6 +959,10 @@ void EmulatedToypad::HandleClient(uintptr_t client_socket) {
       break;
     }
   }
+
+  // A placement command is finished business: hang up, so a client waiting on
+  // end-of-stream gets it immediately.
+  return false;
 }
 
 void EmulatedToypad::ListenerRun(uint16_t port) {
@@ -847,7 +982,7 @@ void EmulatedToypad::ListenerRun(uint16_t port) {
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
   if (::bind(listen_sock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0 ||
-      ::listen(listen_sock, 4) != 0) {
+      ::listen(listen_sock, 16) != 0) {
     REXLOG_WARN("Toypad listener: could not bind/listen on 127.0.0.1:{}", port);
     CloseSock(listen_sock);
     return;
@@ -861,8 +996,32 @@ void EmulatedToypad::ListenerRun(uint16_t port) {
     if (client == kInvalidSocket) {
       break;  // socket closed by the destructor
     }
-    HandleClient(static_cast<uintptr_t>(client));
-    CloseSock(client);
+
+    // A client that connects and then says nothing used to wedge the accept
+    // loop forever, because the first recv had no deadline.
+    SetRecvTimeout(client, kClientIdleTimeoutMs);
+
+    const uintptr_t handle = static_cast<uintptr_t>(client);
+    {
+      std::lock_guard<std::mutex> guard(clients_lock_);
+      client_sockets_.push_back(handle);
+    }
+    client_count_.fetch_add(1);
+    // Detached: a connection lives as long as the app keeps it open, which is
+    // not something the accept loop can wait on. Shutdown closes the sockets
+    // below and waits for the count to drain instead.
+    std::thread(&EmulatedToypad::HandleClient, this, handle).detach();
+  }
+
+  // Drop every open connection, then wait for the threads serving them.
+  {
+    std::lock_guard<std::mutex> guard(clients_lock_);
+    for (const uintptr_t handle : client_sockets_) {
+      CloseSock(static_cast<socket_t>(handle));
+    }
+  }
+  for (int spins = 0; client_count_.load() != 0 && spins < 200; ++spins) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 }
 

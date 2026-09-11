@@ -16,15 +16,19 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
 #include <rex/system/xmemory.h>
+#include <rex/system/xthread.h>
 #include <rex/ui/keybinds.h>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -816,6 +820,229 @@ extern "C" void RexConsoleDrainPendingGuestCall() {
 }
 
 
+// ---------------------------------------------------------------------------
+// Guest thread inspection, and a watchdog for the silent hang.
+//
+// When the title wedges after leaving a level the process stays alive and the
+// overlay stays responsive; the only trace in the log is that the game's own
+// 1.2 s ToyPad colour tick stops and never resumes. Nothing says which guest
+// thread stopped, because a statically recompiled build has no program counter
+// to sample - PPCContext carries no NIA.
+//
+// It carries enough to tell running from wedged, though. lr moves on every bl,
+// last_indirect_target moves on every virtual call, r1 moves with call depth,
+// and ctr moves with every indirect branch. A thread whose (lr, ind, r1, ctr)
+// tuple is bit-for-bit identical for tens of seconds is not running guest code.
+//
+// Sampling another thread's context without stopping it is racy by
+// construction, and that is fine here: a torn read changes the fingerprint,
+// which can only make a wedged thread look alive, never the reverse. A false
+// "moving" costs one more sample; a false "still" would cost a wrong diagnosis.
+
+struct ThreadTrack {
+  uint64_t fingerprint = 0;
+  int64_t first_seen_ms = 0;
+  int64_t last_move_ms = 0;
+  bool seen_moving = false;
+};
+
+std::mutex g_thread_track_mutex;
+std::unordered_map<uint32_t, ThreadTrack> g_thread_tracks;
+
+int64_t SteadyMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+uint64_t ContextFingerprint(const PPCContext* ctx) {
+  constexpr uint64_t kPrime = 1099511628211ull;
+  uint64_t fp = 1469598103934665603ull;
+  fp = (fp ^ ctx->lr) * kPrime;
+  fp = (fp ^ ctx->last_indirect_target) * kPrime;
+  fp = (fp ^ ctx->r1.u64) * kPrime;
+  fp = (fp ^ ctx->ctr.u64) * kPrime;
+  return fp;
+}
+
+// Samples every live guest thread once. Returns one line per thread and, in
+// stalled_out, the ids that have not moved for stall_ms.
+std::vector<std::string> SampleGuestThreads(int64_t stall_ms, std::vector<uint32_t>* stalled_out) {
+  std::vector<std::string> lines;
+  auto* kernel = rex::system::kernel_state();
+  if (!kernel) {
+    lines.emplace_back("  (no kernel state - the title has not started)");
+    return lines;
+  }
+
+  auto threads = kernel->object_table()->GetObjectsByType<rex::system::XThread>();
+  std::sort(threads.begin(), threads.end(),
+            [](const auto& a, const auto& b) { return a->thread_id() < b->thread_id(); });
+
+  const int64_t now = SteadyMs();
+  std::lock_guard<std::mutex> lock(g_thread_track_mutex);
+  for (auto& thread : threads) {
+    if (!thread->is_guest_thread() || !thread->is_running()) {
+      continue;
+    }
+    auto* thread_state = thread->thread_state();
+    auto* ctx = thread_state ? thread_state->context() : nullptr;
+    if (!ctx) {
+      continue;
+    }
+
+    const uint32_t id = thread->thread_id();
+    const uint64_t fingerprint = ContextFingerprint(ctx);
+    ThreadTrack& track = g_thread_tracks[id];
+    if (track.first_seen_ms == 0) {
+      track.first_seen_ms = now;
+      track.last_move_ms = now;
+      track.fingerprint = fingerprint;
+    } else if (fingerprint != track.fingerprint) {
+      track.fingerprint = fingerprint;
+      track.last_move_ms = now;
+      track.seen_moving = true;
+    }
+
+    // A thread that has not moved since it was first looked at counts as
+    // stalled too, once it has been watched long enough to say so. The first
+    // version required a thread to have moved at least once, which made the
+    // tool useless in the one case it was written for - a guest that was
+    // already frozen before anyone asked. It reported "0 stalled" while every
+    // register in the process sat unchanged for half a minute.
+    const int64_t still_ms = now - track.last_move_ms;
+    const int64_t watched_ms = now - track.first_seen_ms;
+    const bool stalled = still_ms >= stall_ms && watched_ms >= stall_ms;
+    if (stalled && stalled_out) {
+      stalled_out->push_back(id);
+    }
+
+    std::string state;
+    if (stalled) {
+      state = fmt::format("STILL {:.1f}s{}", still_ms / 1000.0,
+                          track.seen_moving ? "" : " (never seen moving)");
+    } else if (!track.seen_moving) {
+      state = fmt::format("no movement yet, watched {:.1f}s", watched_ms / 1000.0);
+    } else {
+      state = "moving";
+    }
+
+    lines.push_back(fmt::format("  tid {:04X} {:<4} lr={:08X} ind={:08X} r1={:08X} r3={:08X}  {}",
+                                id, thread->main_thread() ? "main" : "", uint32_t(ctx->lr),
+                                ctx->last_indirect_target, uint32_t(ctx->r1.u64),
+                                uint32_t(ctx->r3.u64), state));
+  }
+
+  if (lines.empty()) {
+    lines.emplace_back("  (no running guest threads)");
+  }
+  return lines;
+}
+
+void ConsoleThreads(std::string_view args) {
+  std::string_view rest = args;
+  const std::string_view seconds_token = NextToken(rest);
+  int64_t stall_ms = 5000;
+  if (!seconds_token.empty()) {
+    const int seconds = std::atoi(std::string(seconds_token).c_str());
+    if (seconds <= 0) {
+      REXLOG_INFO("threads: usage: threads [seconds still before it counts as stalled]");
+      return;
+    }
+    stall_ms = int64_t(seconds) * 1000;
+  }
+
+  // Sample, wait out the stall threshold, sample again. Anything that has not
+  // moved across that gap is genuinely not running, whether or not this is the
+  // first time it was looked at. 250 ms could never reach a 5 s threshold from
+  // a standing start, so a single `threads` call used to report nothing.
+  SampleGuestThreads(stall_ms, nullptr);
+  std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms + 250));
+
+  std::vector<uint32_t> stalled;
+  const auto lines = SampleGuestThreads(stall_ms, &stalled);
+  REXLOG_INFO("threads: guest threads (STILL = no guest code for {}s):", stall_ms / 1000);
+  for (const auto& line : lines) {
+    REXLOG_INFO("{}", line);
+  }
+  REXLOG_INFO("threads: {} stalled.", stalled.size());
+}
+
+// ---------------------------------------------------------------------------
+// The watchdog itself.
+//
+// Started by hand rather than from a static initialiser: creating a thread
+// while the DLL's static objects are constructed runs under the Windows loader
+// lock, which is a deadlock waiting to happen. A debugging aid has no business
+// risking that, and the hang is reproduced deliberately anyway - typing
+// "hangwatch on" as the session starts costs nothing.
+
+std::atomic<bool> g_watchdog_running{false};
+std::atomic<bool> g_watchdog_enabled{false};
+std::atomic<int64_t> g_watchdog_stall_ms{20000};
+
+void WatchdogLoop() {
+  int64_t last_report_ms = 0;
+  bool was_stalled = false;
+  while (g_watchdog_running.load()) {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    if (!g_watchdog_enabled.load()) {
+      continue;
+    }
+
+    std::vector<uint32_t> stalled;
+    const auto lines = SampleGuestThreads(g_watchdog_stall_ms.load(), &stalled);
+    const int64_t now = SteadyMs();
+    if (stalled.empty()) {
+      if (was_stalled) {
+        REXLOG_INFO("hangwatch: guest threads are running again.");
+        was_stalled = false;
+      }
+      continue;
+    }
+
+    // One block when the stall starts, then a reminder once a minute, so a
+    // hang that lasts an hour does not produce an hour of log.
+    if (was_stalled && now - last_report_ms < 60000) {
+      continue;
+    }
+    last_report_ms = now;
+    REXLOG_WARN("hangwatch: {} guest thread(s) have run no guest code for {}s:", stalled.size(),
+                   g_watchdog_stall_ms.load() / 1000);
+    for (const auto& line : lines) {
+      REXLOG_WARN("{}", line);
+    }
+    was_stalled = true;
+  }
+}
+
+void ConsoleHangWatch(std::string_view args) {
+  std::string_view rest = args;
+  const std::string_view token = NextToken(rest);
+
+  if (token == "off") {
+    g_watchdog_enabled.store(false);
+    REXLOG_INFO("hangwatch: off.");
+    return;
+  }
+  if (!token.empty() && token != "on") {
+    const int seconds = std::atoi(std::string(token).c_str());
+    if (seconds <= 0) {
+      REXLOG_INFO("hangwatch: usage: hangwatch [on|off|<seconds>]");
+      return;
+    }
+    g_watchdog_stall_ms.store(int64_t(seconds) * 1000);
+  }
+
+  if (!g_watchdog_running.exchange(true)) {
+    std::thread(WatchdogLoop).detach();
+  }
+  g_watchdog_enabled.store(true);
+  REXLOG_INFO("hangwatch: on, reporting any guest thread that runs no guest code for {}s.",
+              g_watchdog_stall_ms.load() / 1000);
+}
+
+
 REXCVAR_DEFINE_COMMAND_ARGS(peek, ConsolePeek, "Console",
                             "Read guest memory: peek <hex address> [word count]");
 REXCVAR_DEFINE_COMMAND_ARGS(poke, ConsolePoke, "Console",
@@ -836,3 +1063,8 @@ REXCVAR_DEFINE_COMMAND_ARGS(call, ConsoleCall, "Console",
 REXCVAR_DEFINE_COMMAND_ARGS(echo, ConsoleEcho, "Console", "Echo arguments to the console");
 REXCVAR_DEFINE_COMMAND_ARGS(find, ConsoleFind, "Console",
                             "List cvar/command names containing a substring");
+
+REXCVAR_DEFINE_COMMAND_ARGS(threads, ConsoleThreads, "Console",
+                            "Dump guest threads and whether each is running: threads [seconds]");
+REXCVAR_DEFINE_COMMAND_ARGS(hangwatch, ConsoleHangWatch, "Console",
+                            "Report guest threads that stop running: hangwatch [on|off|<seconds>]");

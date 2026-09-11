@@ -16,6 +16,7 @@
 #include <string>
 
 #include <rex/chrono/chrono_steady_cast.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/threading.h>
@@ -30,6 +31,13 @@
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 #include <rex/thread/atomic.h>
+
+REXCVAR_DEFINE_UINT32(
+    critical_section_stuck_seconds, 5, "Runtime",
+    "Report a guest critical section that still has not been acquired after this many seconds, "
+    "naming the lock and the thread holding it. 0 restores the original behaviour of waiting "
+    "forever - which is why a lock that is never released showed up as a completely silent freeze "
+    "with nothing at all in the log.");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -399,7 +407,38 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 
   if (rex::thread::atomic_inc(&cs->lock_count) != 0) {
     // Create a full waiter.
-    xeKeWaitForSingleObject(reinterpret_cast<void*>(cs.host_address()), 8, 0, 0, nullptr);
+    //
+    // Waiting without a timeout is correct, but it is also how a lock that is
+    // never released becomes an unexplainable freeze: the thread parks forever
+    // and the log never says which lock it wanted or who was holding it. Wait
+    // in slices instead and report once when a slice expires. The loop keeps
+    // waiting until the event is actually signalled, so the blocking behaviour
+    // is unchanged - only the silence is.
+    void* const host_cs = reinterpret_cast<void*>(cs.host_address());
+    const uint32_t stuck_seconds = REXCVAR_GET(critical_section_stuck_seconds);
+    if (!stuck_seconds) {
+      xeKeWaitForSingleObject(host_cs, 8, 0, 0, nullptr);
+    } else {
+      // Guest timeouts are in 100 ns units; negative means relative.
+      const int64_t slice = -10000000LL * static_cast<int64_t>(stuck_seconds);
+      bool reported = false;
+      for (;;) {
+        uint64_t timeout = static_cast<uint64_t>(slice);
+        if (xeKeWaitForSingleObject(host_cs, 8, 0, 0, &timeout) != X_STATUS_TIMEOUT) {
+          break;
+        }
+        if (!reported) {
+          reported = true;
+          REXKRNL_ERROR(
+              "STUCK-LOCK: critical section {:#010x} still not acquired after {}s. owner=guest "
+              "thread object {:#010x}, lock_count={}, recursion={}; waiting thread is {:#x}. An "
+              "owner of 0, or one naming a thread that has exited, means the lock was leaked.",
+              cs.guest_address(), stuck_seconds, uint32_t(cs->owning_thread),
+              int32_t(cs->lock_count), int32_t(cs->recursion_count),
+              XThread::GetCurrentThreadId());
+        }
+      }
+    }
   }
 
   assert_true(cs->owning_thread == 0);

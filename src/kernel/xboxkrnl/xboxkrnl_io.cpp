@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <rex/cvar.h>
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -28,6 +29,12 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
+
+REXCVAR_DEFINE_BOOL(trace_file_opens, false, "Runtime",
+                    "Log every file the title opens, not just the ones that fail. Turns the log "
+                    "into a record of what the game went looking for, which is how you tell a "
+                    "transition that asked for a level and was refused from one that never asked "
+                    "at all. Chatty - meant for a single reproduction, not for playing.");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -172,6 +179,9 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
     REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
   } else {
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
+    if (REXCVAR_GET(trace_file_opens)) {
+      REXKRNL_INFO("[NtCreateFile] OPENED: path='{}' handle={:#x}", target_path, handle);
+    }
   }
   return result;
 }

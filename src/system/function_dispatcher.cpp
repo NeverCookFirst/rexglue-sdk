@@ -18,7 +18,7 @@
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
 #include <mutex>
-#include <unordered_set>
+#include <unordered_map>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -32,6 +32,12 @@ REXCVAR_DEFINE_BOOL(invalid_function_nonfatal, false, "Runtime",
                     "Log calls to unregistered guest functions and keep running instead of "
                     "aborting. Debug aid for collecting every missing address in one session; "
                     "skipping a real function can corrupt guest state, so leave it off to play.");
+
+REXCVAR_DEFINE_BOOL(invalid_function_log_every, false, "Runtime",
+                    "Report every skipped call, not just the first one per address. The default "
+                    "reports each address once, which is right for collecting a list but hides "
+                    "the skip you care about when the same address was already hit earlier in "
+                    "the session. Needs invalid_function_nonfatal.");
 
 namespace rex::runtime {
 
@@ -53,18 +59,29 @@ static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
 
   // Debug aid: report the address and return, so one play session can surface
   // every missing function instead of dying at the first one. Each address is
-  // logged once - these are hit from tight loops and would drown the log.
+  // logged once by default - these are hit from tight loops and would drown the
+  // log - but the count is kept so a repeat is not completely invisible.
   static std::mutex seen_mutex;
-  static std::unordered_set<uint32_t> seen_addresses;
-  bool first_time;
+  static std::unordered_map<uint32_t, uint64_t> seen_addresses;
+  uint64_t hit_count;
   {
     std::lock_guard<std::mutex> lock(seen_mutex);
-    first_time = seen_addresses.insert(address).second;
+    hit_count = ++seen_addresses[address];
   }
-  if (first_time) {
-    REXSYS_ERROR("MISSING-FUNCTION 0x{:08X} (skipped; guest state may be corrupt from here)",
-                 address);
+  if (hit_count != 1 && !REXCVAR_GET(invalid_function_log_every)) {
+    return;
   }
+
+  // The caller matters more than the callee. Nearly every one of these is a
+  // virtual dispatch thunk - lwz r12,0(r3) / lwz r11,slot(r12) / mtctr / bctr -
+  // so the target address says only "some vtable slot", while lr names the game
+  // function that made the call and r3 the object it was called on. That pair
+  // is what turns "a call was skipped" into "this subsystem lost this method".
+  REXSYS_ERROR(
+      "MISSING-FUNCTION 0x{:08X} called from 0x{:08X} on object 0x{:08X} (hit #{}, thread {}; "
+      "skipped, guest state may be corrupt from here)",
+      address, static_cast<uint32_t>(ctx.lr), static_cast<uint32_t>(ctx.r3.u64), hit_count,
+      ThreadState::GetThreadID());
 }
 
 PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {

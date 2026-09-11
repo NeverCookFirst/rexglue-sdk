@@ -16,12 +16,39 @@
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xevent.h>
+#include <vector>
+
+#include <rex/system/file_fixups.h>
 #include <rex/system/xfile.h>
 #include <rex/thread/mutex.h>
 
 #include <span>
 
 namespace rex::system {
+
+namespace {
+std::vector<FileReadFixup>& FileReadFixups() {
+  // Function-local so registration from another binary's static initialiser
+  // cannot run before this vector exists.
+  static std::vector<FileReadFixup> fixups;
+  return fixups;
+}
+}  // namespace
+
+void RegisterFileReadFixup(FileReadFixup fixup) {
+  if (fixup) {
+    FileReadFixups().push_back(std::move(fixup));
+  }
+}
+
+bool HasFileReadFixups() { return !FileReadFixups().empty(); }
+
+void ApplyFileReadFixups(const std::string& name, uint64_t offset, uint8_t* data, size_t length) {
+  for (const auto& fixup : FileReadFixups()) {
+    fixup(name, offset, data, length);
+  }
+}
+
 
 XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchronous)
     : XObject(kernel_state, kObjectType), file_(file), is_synchronous_(synchronous) {
@@ -164,6 +191,19 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
                   buffer_length),
               size_t(byte_offset), &bytes_read);
           if (XSUCCEEDED(result)) {
+            // Before the invalidation callbacks, so a fixup that rewrites
+            // bytes headed for texture or vertex memory is part of what the
+            // GPU is told about.
+            if (HasFileReadFixups() && bytes_read) {
+              ApplyFileReadFixups(
+                  name(), byte_offset,
+                  buffer_physical_heap
+                      ? memory()->TranslatePhysical(
+                            buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
+                      : memory()->TranslateVirtual(buffer_guest_address),
+                  bytes_read);
+            }
+
             if (buffer_physical_heap) {
               buffer_physical_heap->TriggerCallbacks(
                   rex::thread::global_critical_region::AcquireDirect(), buffer_guest_address,

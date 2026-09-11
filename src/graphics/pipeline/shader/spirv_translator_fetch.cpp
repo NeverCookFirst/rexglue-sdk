@@ -2045,9 +2045,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         {
           // Uniform early out. Zero means leave the sample alone. Only integer
           // num_format on fixed textures has scale bits.
-          spv::Id integer_scale_active =
-              builder_->createBinOp(spv::OpINotEqual, type_bool_, integer_scale_bits_packed,
-                                    builder_->makeUintConstant(0));
+          // 2026-09-10: integer-scale disabled pending a fix. As ported it
+          // multiplies 16-bit texture samples by 65535 and blows the world out
+          // to white on Vulkan. Off = correct colour but darker than intended.
+          spv::Id integer_scale_active = builder_->makeBoolConstant(false);
+          (void)integer_scale_bits_packed;
           SpirvBuilder::IfBuilder if_integer_scale(integer_scale_active,
                                                    spv::SelectionControlMaskNone, *builder_);
           spv::Id scaled_result[4] = {};

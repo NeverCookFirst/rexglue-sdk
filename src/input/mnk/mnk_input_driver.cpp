@@ -58,7 +58,9 @@ REXCVAR_DEFINE_STRING(keybind_dpad_down, "", "Input/Keybinds/Controller", "D-pad
 REXCVAR_DEFINE_STRING(keybind_dpad_left, "", "Input/Keybinds/Controller", "D-pad left");
 REXCVAR_DEFINE_STRING(keybind_dpad_right, "", "Input/Keybinds/Controller",
                       "D-pad right");
-REXCVAR_DEFINE_STRING(keybind_back, "Backspace", "Input/Keybinds/Controller", "Back button");
+// The '=' key, off to the side where nothing else is. Backspace used to be the
+// default and kept firing Back by accident, which is why it moved here.
+REXCVAR_DEFINE_STRING(keybind_back, "Plus", "Input/Keybinds/Controller", "Back button");
 REXCVAR_DEFINE_STRING(keybind_start, "Return,Escape", "Input/Keybinds/Controller", "Start button");
 REXCVAR_DEFINE_STRING(keybind_guide, "", "Input/Keybinds/Controller", "Guide button");
 

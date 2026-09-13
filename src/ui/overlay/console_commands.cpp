@@ -242,6 +242,83 @@ void ConsolePoke(std::string_view args) {
 }
 
 // ---------------------------------------------------------------------------
+// Host addresses, for external debuggers.
+//
+// Cheat Engine and friends see host addresses, not guest ones. The arena is a
+// file mapping placed wherever the 64-bit address space had room, so its base
+// is not a constant we can write down once: this prints the one this run got,
+// and converts either way.
+
+bool ParseHex64(std::string_view text, uint64_t& out) {
+  if (text.empty()) {
+    return false;
+  }
+  if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+    text.remove_prefix(2);
+  }
+  uint64_t value = 0;
+  for (char c : text) {
+    uint64_t digit;
+    if (c >= '0' && c <= '9') {
+      digit = static_cast<uint64_t>(c - '0');
+    } else if (c >= 'a' && c <= 'f') {
+      digit = static_cast<uint64_t>(c - 'a' + 10);
+    } else if (c >= 'A' && c <= 'F') {
+      digit = static_cast<uint64_t>(c - 'A' + 10);
+    } else {
+      return false;
+    }
+    value = (value << 4) | digit;
+  }
+  out = value;
+  return true;
+}
+
+void ConsoleMemBase(std::string_view args) {
+  uint8_t* base = GuestBase();
+  if (!base) {
+    REXLOG_INFO("The guest is not running yet.");
+    return;
+  }
+  const uint64_t base_addr = reinterpret_cast<uint64_t>(base);
+
+  std::string_view rest = args;
+  const std::string_view tok = NextToken(rest);
+  if (tok.empty()) {
+    REXLOG_INFO("membase: guest 0x00000000 is at host 0x{:016X}", base_addr);
+    REXLOG_INFO("         physical window (guest 0xA0000000..) at host 0x{:016X}",
+                base_addr + 0x100000000ull);
+    REXLOG_INFO("         host address = 0x{:016X} + guest address", base_addr);
+    REXLOG_INFO("         membase <hex> converts a guest address to host, or back");
+    REXLOG_INFO("         Guest values are big-endian; see docs/cheat-engine.md");
+    return;
+  }
+
+  uint64_t value = 0;
+  if (!ParseHex64(tok, value)) {
+    REXLOG_INFO("membase: usage: membase [<hex guest or host address>]");
+    return;
+  }
+
+  if (value < 0x100000000ull) {
+    REXLOG_INFO("membase: guest 0x{:08X} -> host 0x{:016X}", static_cast<uint32_t>(value),
+                base_addr + value);
+  } else if (value >= base_addr && value < base_addr + 0x120000000ull) {
+    const uint64_t offset = value - base_addr;
+    if (offset < 0x100000000ull) {
+      REXLOG_INFO("membase: host 0x{:016X} -> guest 0x{:08X}", value,
+                  static_cast<uint32_t>(offset));
+    } else {
+      REXLOG_INFO("membase: host 0x{:016X} -> physical 0x{:08X}", value,
+                  static_cast<uint32_t>(offset - 0x100000000ull));
+    }
+  } else {
+    REXLOG_INFO("membase: host 0x{:016X} is outside the guest arena [0x{:016X}, 0x{:016X})", value,
+                base_addr, base_addr + 0x120000000ull);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Calling guest functions.
 //
 // peek and poke answer "what does this global hold", but much of the title's
@@ -1042,6 +1119,10 @@ void ConsoleHangWatch(std::string_view args) {
               g_watchdog_stall_ms.load() / 1000);
 }
 
+
+REXCVAR_DEFINE_COMMAND_ARGS(membase, ConsoleMemBase, "Console",
+                            "Print the host address of guest memory, for Cheat Engine: "
+                            "membase [<hex address>]");
 
 REXCVAR_DEFINE_COMMAND_ARGS(peek, ConsolePeek, "Console",
                             "Read guest memory: peek <hex address> [word count]");

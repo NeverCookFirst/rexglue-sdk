@@ -15,9 +15,17 @@
 #include <libusb.h>
 
 #include <algorithm>
+#include <string_view>
 #include <cstring>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
+
+REXCVAR_DEFINE_STRING(toypad_passthrough_frame, "auto", "Input",
+                      "How to forward command frames to a physical portal: auto picks by "
+                      "device (keep the Xbox 360 wrapper, strip it for a PC/PS3 pad), "
+                      "keep and strip force it")
+    .allowed({"auto", "keep", "strip"});
 
 namespace rex::input {
 
@@ -129,6 +137,13 @@ void HardwarePortal::OpenDevice() {
 
     handle_ = handle;
     device_name_ = entry.name;
+
+    const std::string_view policy = REXCVAR_GET(toypad_passthrough_frame);
+    keep_wrapper_ = policy == "keep"   ? true
+                    : policy == "strip" ? false
+                                        : entry.speaks_xbox_frame;
+    REXLOG_INFO("Portal: forwarding frames with the Xbox wrapper {} ({}).",
+                keep_wrapper_ ? "kept" : "stripped", policy);
     REXLOG_INFO("Portal: using {} ({:04X}:{:04X}) over USB.", entry.name,
                 entry.vendor_id, entry.product_id);
     return;
@@ -182,10 +197,12 @@ X_STATUS HardwarePortal::ReadInternal(std::span<uint8_t> data,
     return X_ERROR_FUNCTION_FAILED;
   }
 
-  // Hand the guest the frame back in the shape it writes in. Length is the
-  // header's payload count plus the type, length and checksum bytes.
+  // Hand the guest the frame back in the shape it writes in. A device that
+  // speaks the wrapper already answers in that shape, so only rebuild it when
+  // it was stripped on the way out. Length is the header's payload count plus
+  // the type, length and checksum bytes.
   std::array<uint8_t, kPortalBufferSize> out{};
-  if (frame_offset_ > 0) {
+  if (frame_offset_ > 0 && !keep_wrapper_) {
     const size_t len = std::min<size_t>(size_t(frame[1]) + 3, out.size());
     out[0] = frame_prefix_byte_;
     out[1] = static_cast<uint8_t>(len);
@@ -205,9 +222,9 @@ X_STATUS HardwarePortal::WriteInternal(std::span<uint8_t> data) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-  // Find the 0x55 command frame. The Xbox 360 transport prepends a short
-  // wrapper (0x0B <len> ...) that the portal itself knows nothing about, so
-  // send it what it speaks and remember the wrapper for the reply.
+  // Find the 0x55 command frame. The guest prepends a short wrapper
+  // (0x0B <len> ...) that a PC/PS3 portal knows nothing about, so send each
+  // device what it speaks and remember the wrapper for the reply.
   size_t offset = 0;
   const size_t scan_limit = std::min<size_t>(4, data.size());
   for (; offset < scan_limit; offset++) {
@@ -226,9 +243,10 @@ X_STATUS HardwarePortal::WriteInternal(std::span<uint8_t> data) {
                 frame_prefix_byte_);
   }
 
+  const size_t send_from = keep_wrapper_ ? 0 : offset;
   std::array<uint8_t, kPortalBufferSize> frame{};
-  std::memcpy(frame.data(), data.data() + offset,
-              std::min(data.size() - offset, frame.size()));
+  std::memcpy(frame.data(), data.data() + send_from,
+              std::min(data.size() - send_from, frame.size()));
 
   const int result = libusb_interrupt_transfer(
       handle_, write_endpoint_, frame.data(), static_cast<int>(frame.size()),

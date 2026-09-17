@@ -33,6 +33,9 @@
 REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
                     "Allow variable refresh rate and tearing");
 
+// Defined in presenter.cpp - same library, shared with any other backend.
+REXCVAR_DECLARE(int32_t, present_max_output_height);
+
 namespace rex::ui::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -343,6 +346,23 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
       std::min(new_surface_width, uint32_t(D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION));
   uint32_t new_swap_chain_height =
       std::min(new_surface_height, uint32_t(D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION));
+
+  // An output cap makes the swap chain smaller than the window on purpose.
+  // Everything downstream - the guest output upscale, the overlays - then works
+  // at that size, and the display engine stretches the finished image to the
+  // window at no cost to us. The swap chain already supports being a different
+  // size from the surface (DXGI_SCALING_STRETCH below), so this rides on a path
+  // that already existed rather than adding a pass.
+  const int32_t max_output_height = REXCVAR_GET(present_max_output_height);
+  if (max_output_height > 0 && new_swap_chain_height > uint32_t(max_output_height) &&
+      new_swap_chain_height != 0) {
+    // Width follows the window's aspect ratio, so the stretch does not distort.
+    const uint64_t capped_width = (uint64_t(new_swap_chain_width) * uint32_t(max_output_height) +
+                                   (new_swap_chain_height >> 1)) /
+                                  new_swap_chain_height;
+    new_swap_chain_width = std::max(uint32_t(1), uint32_t(capped_width));
+    new_swap_chain_height = uint32_t(max_output_height);
+  }
 
   // ConnectOrReconnectPaintingToSurfaceFromUIThread may be called only for the
   // surface of the current swap chain or when the old swap chain has already
@@ -1155,9 +1175,19 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // fullscreen is ever used in, the allow tearing flag must not be passed in
   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
   // presentation model used in Direct3D 12).
+  //
+  // Presenting with a non-zero sync interval instead - the obvious way to stop
+  // the tearing players report - was tried on 2026-09-17 and reverted. The
+  // presenter shares the guest's D3D12 direct queue, so a vsync-gated present
+  // keeps that queue occupied and the guest's own rendering ends up behind it:
+  // measured at a healthy 96-100 presents/s while one guest frame took 1040 ms.
+  // Fixing this properly means not sharing the queue, or presenting only when
+  // the guest has actually produced a frame. Until then the `vsync` cvar does
+  // not touch presentation at all.
   HRESULT present_result = paint_context_.swap_chain->Present(
       0, DXGI_PRESENT_RESTART |
              (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.

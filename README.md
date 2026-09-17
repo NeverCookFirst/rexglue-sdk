@@ -1,3 +1,24 @@
+> [!NOTE]
+> **This is a fork**, maintained for
+> [Dimensions Recompiled](https://github.com/NeverCookFirst/DimensionsRecomp).
+> Upstream is [rexglue/rexglue-sdk](https://github.com/rexglue/rexglue-sdk) and
+> everything below describes the SDK itself, not this fork.
+>
+> Work in the `toypad-ui` branch, which is what the game's releases are built
+> from: the emulated Toy Pad and its UI, a codegen fix behind a crash on ropes,
+> discrete GPU selection, keyboard input, crash logging, a settings overlay with
+> a reset-to-defaults button, and the in-game cheat menu. Upstream builds fine
+> and then behaves differently from every release, which is a miserable thing to
+> debug.
+>
+> **Building:** use the presets. `cmake --preset win-amd64` then
+> `cmake --build out/build/win-amd64 --config Release --target install`.
+> The x86 baseline is `REXGLUE_X86_BASELINE` (default `x86-64-v2`); the SDK's
+> byte-swap helpers need SSSE3, so plain `x86-64` will not compile. For a CPU
+> without AVX2, pass the same baseline to the game as well - see
+> [README-dev](https://github.com/NeverCookFirst/DimensionsRecomp/blob/main/README-dev.md)
+> in the game repository.
+
 > [!CAUTION]
 > This project is in early development. Expect things to not work quite right and there to be significant changes and breaking public API updates as development progresses. Contributions and feedback are welcome, but please be aware that the codebase is still evolving rapidly.
 

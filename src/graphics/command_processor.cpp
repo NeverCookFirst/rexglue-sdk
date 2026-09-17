@@ -35,7 +35,24 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
-REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+// Off by default and locked (kInitOnly), so the settings UI greys it out and
+// nothing can flip it at runtime.
+//
+// The name is inherited from xenia and is misleading: it does NOT stop the
+// image tearing. What it controls is the guest side - the pace of the guest's
+// vblank interrupt (graphics_system.cpp) and the GPU thread's wait policy
+// (below). Every shipped install has had it off since the installer started
+// writing legodimensions.toml, so off is the configuration that is actually
+// tested; true was only ever reachable by hand.
+//
+// Players kept turning it on to chase the tearing, which it cannot fix, so it
+// is no longer theirs to turn on. Making it genuinely drive host presentation
+// was tried on 2026-09-17 and reverted - see the comment on Present in
+// d3d12_presenter.cpp for the measurements.
+REXCVAR_DEFINE_BOOL(vsync, false, "GPU",
+                    "Guest vblank pacing and GPU thread wait policy. Locked: this does not "
+                    "control host vertical sync and will not stop screen tearing.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 // Deliberately separate from vsync: vsync can only lock to the display's own
 // refresh, so on a 90 Hz panel it caps at 90, and falling below the refresh

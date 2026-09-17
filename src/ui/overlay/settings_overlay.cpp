@@ -567,10 +567,40 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   }
   ImGui::EndChild();
 
-  // Bottom bar: Save button.
+  // Bottom bar: Save and reset buttons.
   ImGui::Separator();
   if (ImGui::Button("Save to config")) {
     rex::cvar::SaveConfig(config_path_);
+  }
+  ImGui::SameLine();
+  // A way back for anyone who changed settings until the game stopped working.
+  // Behind a confirmation because it also throws away keybinds, and written to
+  // the config right away - a setting that only takes effect on the next start
+  // is exactly the kind that gets a run stuck, so the reset has to survive a
+  // restart too.
+  if (ImGui::Button("Reset all to defaults")) {
+    ImGui::OpenPopup("Reset all settings?");
+  }
+  if (ImGui::BeginPopupModal("Reset all settings?", nullptr,
+                             ImGuiWindowFlags_AlwaysAutoResize)) {
+    ImGui::TextUnformatted("Every setting and keybind goes back to its default value,");
+    ImGui::TextUnformatted("and the config file is overwritten with them.");
+    ImGui::TextUnformatted("Settings marked as restart-only apply on the next start.");
+    ImGui::Separator();
+    if (ImGui::Button("Reset")) {
+      rex::cvar::ResetAllToDefaults();
+      rex::cvar::SaveConfig(config_path_);
+      // Anything half-typed or half-rebound refers to a value that just
+      // changed underneath it.
+      capturing_bind_name_.clear();
+      editing_text_name_.clear();
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) {
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
   }
   ImGui::SameLine();
   ImGui::TextDisabled("(%s)", config_path_.filename().string().c_str());

@@ -77,6 +77,16 @@ REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output 
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 #endif
 
+REXCVAR_DEFINE_INT32(present_max_output_height, 0, "UI/Presenter",
+                     "Cap the resolution the frame is presented at, in lines (0 = off, use the "
+                     "whole window). The upscaler's target is what actually costs GPU time, so a "
+                     "1080 cap makes borderless fullscreen on a 1440p or 4K monitor cost what a "
+                     "1080p window costs; the display engine stretches the result to the window "
+                     "for free. Width follows from the window's aspect ratio. The on-screen "
+                     "overlays are drawn into the same image, so they are stretched too.")
+    .range(0, 4320)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
                     "Enable output dithering in the final present pass")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);

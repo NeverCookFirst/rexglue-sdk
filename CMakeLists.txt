@@ -52,6 +52,38 @@ if (REXGLUE_ENABLE_FIDELITYFX AND
         "REXGLUE_ENABLE_FIDELITYFX requires at least one graphics backend")
 endif()
 
+#==========================================================
+# x86 instruction-set baseline
+#==========================================================
+# The SDK's own code uses SSSE3 intrinsics unconditionally (the byte-swap
+# helpers in src/core/memory.cpp are _mm_shuffle_epi8). Clang's bare x86-64
+# default is SSE2 only, so a configure that sets no -march at all fails to
+# compile them - which is exactly what anyone who configured without
+# --preset used to hit, since only the presets carried the flag.
+#
+# So the baseline lives here instead, and the presets merely agree with it.
+# Lower it for an older CPU (x86-64-v2 = Nehalem/Bulldozer, SSE4.2; the
+# runtime needs at least SSSE3, so plain "x86-64" will not build):
+#
+#   cmake -S rexglue-sdk -B ... -DREXGLUE_X86_BASELINE=x86-64-v2
+#
+# Set it to "none" to pass your own -march in CMAKE_C_FLAGS/CMAKE_CXX_FLAGS.
+set(REXGLUE_X86_BASELINE "x86-64-v2" CACHE STRING
+    "x86 -march baseline for the SDK (x86-64-v2, x86-64-v3, native, or none)")
+
+if(REXGLUE_X86_BASELINE AND NOT REXGLUE_X86_BASELINE STREQUAL "none"
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64"
+   AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    # Only when the caller has not already picked one, so an explicit
+    # -march in CMAKE_CXX_FLAGS still wins.
+    if(NOT CMAKE_CXX_FLAGS MATCHES "-march=" AND NOT CMAKE_C_FLAGS MATCHES "-march=")
+        add_compile_options(-march=${REXGLUE_X86_BASELINE})
+        message(STATUS "ReXGlue x86 baseline: -march=${REXGLUE_X86_BASELINE}")
+    else()
+        message(STATUS "ReXGlue x86 baseline: -march already set by the caller, left alone")
+    endif()
+endif()
+
 # Root of the SDK source tree
 set(REXGLUE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 

@@ -384,6 +384,11 @@ u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECT
   return xeRtlInitializeCriticalSectionAndSpinCount(cs, cs.guest_address(), spin_count);
 }
 
+namespace {
+// Defined below, next to the other reporting helper.
+void DescribeCriticalSectionOwner(uint32_t owner_object);
+}  // namespace
+
 void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
   uint32_t spin_count = cs->header.absolute * 256;
@@ -436,6 +441,11 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
               cs.guest_address(), stuck_seconds, uint32_t(cs->owning_thread),
               int32_t(cs->lock_count), int32_t(cs->recursion_count),
               XThread::GetCurrentThreadId());
+          // The owner above is an object pointer, and the thread dump from the
+          // `threads` console command lists thread ids - so on their own the
+          // two cannot be joined, and the one question worth asking ("what is
+          // the holder doing?") stays unanswerable. Name the owner properly.
+          DescribeCriticalSectionOwner(uint32_t(cs->owning_thread));
         }
       }
     }
@@ -445,6 +455,45 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   cs->owning_thread = cur_thread;
   cs->recursion_count = 1;
 }
+
+namespace {
+
+// Turns the owning-thread object pointer a stuck critical section carries into
+// something a person can act on: which thread it is, and where that thread is
+// parked. Best effort - a lock can genuinely be leaked by a thread that has
+// already exited, which is why the caller's message says so.
+void DescribeCriticalSectionOwner(uint32_t owner_object) {
+  if (!owner_object) {
+    return;  // Leaked outright; the message above already says what that means.
+  }
+  auto* kernel = REX_KERNEL_STATE();
+  if (!kernel) {
+    return;
+  }
+  for (auto& thread : kernel->object_table()->GetObjectsByType<XThread>()) {
+    if (!thread || thread->guest_object() != owner_object) {
+      continue;
+    }
+    auto* thread_state = thread->thread_state();
+    auto* ctx = thread_state ? thread_state->context() : nullptr;
+    if (ctx) {
+      REXKRNL_ERROR(
+          "STUCK-LOCK: the owner is tid {:#06x} ({}), parked at lr={:08X} with r3={:08X}. If that "
+          "lr is another RtlEnterCriticalSection, the two threads are holding each other.",
+          thread->thread_id(), thread->name().empty() ? "unnamed" : thread->name(),
+          uint32_t(ctx->lr), uint32_t(ctx->r3.u32));
+    } else {
+      REXKRNL_ERROR("STUCK-LOCK: the owner is tid {:#06x} ({}), with no context to report.",
+                    thread->thread_id(), thread->name().empty() ? "unnamed" : thread->name());
+    }
+    return;
+  }
+  REXKRNL_ERROR(
+      "STUCK-LOCK: no live thread owns object {:#010x} - it exited while holding the lock.",
+      owner_object);
+}
+
+}  // namespace
 
 u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   uint32_t thread = XThread::GetCurrentThread()->guest_object();

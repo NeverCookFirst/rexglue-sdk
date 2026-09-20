@@ -98,6 +98,76 @@ bool HardwarePortal::FindEndpoints(libusb_device_handle* handle) {
   return true;
 }
 
+uint8_t HardwarePortal::NextGipSequence() {
+  const uint8_t sequence = gip_sequence_;
+  gip_sequence_ =
+      gip_sequence_ == 255 ? 1 : static_cast<uint8_t>(gip_sequence_ + 1);
+  return sequence;
+}
+
+bool HardwarePortal::OpenGipGateway() {
+  // 55 0F B0 01 "(c) LEGO 2014" F7 - the same wake frame the PC pad takes, but
+  // here it has to travel inside GIP.
+  static constexpr uint8_t kLegoWake[] = {0x55, 0x0F, 0xB0, 0x01, 0x28, 0x63,
+                                          0x29, 0x20, 0x4C, 0x45, 0x47, 0x4F,
+                                          0x20, 0x32, 0x30, 0x31, 0x34, 0xF7};
+
+  std::array<uint8_t, kGipHeaderSize + kPortalBufferSize> wake{};
+  wake[0] = 0x21;
+  wake[1] = 0x00;
+  wake[2] = NextGipSequence();
+  wake[3] = kPortalBufferSize;
+  std::memcpy(wake.data() + kGipHeaderSize, kLegoWake, sizeof(kLegoWake));
+
+  int result =
+      libusb_interrupt_transfer(handle_, write_endpoint_, wake.data(),
+                                static_cast<int>(wake.size()), nullptr, kTimeoutMs);
+  if (result < 0) {
+    REXLOG_ERROR("Portal: GIP wake failed: {}", libusb_error_name(result));
+    return false;
+  }
+
+  // The wake on its own draws no answer. The pad holds it back until the host
+  // declares authentication complete, and that packet is what opens the
+  // gateway - no real crypto handshake is needed.
+  uint8_t auth[] = {0x06, 0x20, NextGipSequence(), 0x02, 0x01, 0x00};
+  result = libusb_interrupt_transfer(handle_, write_endpoint_, auth,
+                                     static_cast<int>(sizeof(auth)), nullptr,
+                                     kTimeoutMs);
+  if (result < 0) {
+    REXLOG_ERROR("Portal: GIP authenticate failed: {}", libusb_error_name(result));
+    return false;
+  }
+
+  // The reply lands about 10 ms later. Anything ahead of it is the ANNOUNCE the
+  // pad repeats twice a second for as long as it has no host.
+  std::array<uint8_t, 64> frame{};
+  for (int attempt = 0; attempt < 20; attempt++) {
+    int read_count = 0;
+    result = libusb_interrupt_transfer(handle_, read_endpoint_, frame.data(),
+                                       static_cast<int>(frame.size()),
+                                       &read_count, kTimeoutMs);
+    if (result == LIBUSB_ERROR_TIMEOUT) {
+      continue;
+    }
+    if (result < 0) {
+      REXLOG_ERROR("Portal: GIP handshake read failed: {}",
+                   libusb_error_name(result));
+      return false;
+    }
+    if (read_count >= static_cast<int>(kGipHeaderSize) && frame[0] == 0x21) {
+      REXLOG_INFO("Portal: GIP gateway open.");
+      return true;
+    }
+  }
+
+  REXLOG_ERROR(
+      "Portal: the Xbox One pad did not answer the GIP handshake. It goes mute "
+      "after a finished session and after a stray IDENTIFY/POWER packet; "
+      "unplug it and plug it back in.");
+  return false;
+}
+
 void HardwarePortal::OpenDevice() {
   if (!context_ || handle_) {
     return;
@@ -144,6 +214,14 @@ void HardwarePortal::OpenDevice() {
                                         : entry.speaks_xbox_frame;
     REXLOG_INFO("Portal: forwarding frames with the Xbox wrapper {} ({}).",
                 keep_wrapper_ ? "kept" : "stripped", policy);
+
+    speaks_gip_ = entry.speaks_gip;
+    gip_sequence_ = 1;
+    if (speaks_gip_ && !OpenGipGateway()) {
+      CloseDevice();
+      continue;
+    }
+
     REXLOG_INFO("Portal: using {} ({:04X}:{:04X}) over USB.", entry.name,
                 entry.vendor_id, entry.product_id);
     return;
@@ -165,6 +243,8 @@ void HardwarePortal::CloseDevice() {
   device_name_ = nullptr;
   read_endpoint_ = 0;
   write_endpoint_ = 0;
+  speaks_gip_ = false;
+  gip_sequence_ = 1;
 }
 
 X_STATUS HardwarePortal::ReadInternal(std::span<uint8_t> data,
@@ -174,8 +254,13 @@ X_STATUS HardwarePortal::ReadInternal(std::span<uint8_t> data,
   }
 
   std::array<uint8_t, kPortalBufferSize> frame{};
+  // A GIP frame is four bytes longer than the LEGO frame it carries, so reading
+  // straight into a 32-byte buffer would overflow it. Take a whole packet and
+  // unwrap below.
+  std::array<uint8_t, 64> gip_frame{};
   const int result = libusb_interrupt_transfer(
-      handle_, read_endpoint_, frame.data(), static_cast<int>(frame.size()),
+      handle_, read_endpoint_, speaks_gip_ ? gip_frame.data() : frame.data(),
+      static_cast<int>(speaks_gip_ ? gip_frame.size() : frame.size()),
       &read_count, kTimeoutMs);
 
   switch (result) {
@@ -195,6 +280,18 @@ X_STATUS HardwarePortal::ReadInternal(std::span<uint8_t> data,
   if (result < 0) {
     REXLOG_WARN("Portal[Read] returned error: {}", libusb_error_name(result));
     return X_ERROR_FUNCTION_FAILED;
+  }
+
+  if (speaks_gip_) {
+    // Only gateway frames carry LEGO payloads. ANNOUNCE and any other GIP
+    // chatter has to be swallowed here, or the guest would read it as a reply.
+    if (read_count < static_cast<int>(kGipHeaderSize) || gip_frame[0] != 0x21) {
+      read_count = 0;
+      return X_ERROR_SUCCESS;
+    }
+    std::memcpy(frame.data(), gip_frame.data() + kGipHeaderSize,
+                std::min(static_cast<size_t>(read_count) - kGipHeaderSize,
+                         frame.size()));
   }
 
   // Hand the guest the frame back in the shape it writes in. A device that
@@ -241,6 +338,34 @@ X_STATUS HardwarePortal::WriteInternal(std::span<uint8_t> data) {
     frame_prefix_byte_ = offset > 0 ? data[0] : 0;
     REXLOG_INFO("Portal: guest frame offset {} (prefix {:02X})", offset,
                 frame_prefix_byte_);
+  }
+
+  if (speaks_gip_) {
+    // The Xbox One pad takes nothing but GIP: the guest wrapper always comes
+    // off, and the bare LEGO frame goes out inside 21 00 <seq> 20, zero padded
+    // to the full 32 bytes the pad expects.
+    std::array<uint8_t, kGipHeaderSize + kPortalBufferSize> gip{};
+    gip[0] = 0x21;
+    gip[1] = 0x00;
+    gip[2] = NextGipSequence();
+    gip[3] = kPortalBufferSize;
+    std::memcpy(gip.data() + kGipHeaderSize, data.data() + offset,
+                std::min(data.size() - offset,
+                         static_cast<size_t>(kPortalBufferSize)));
+
+    const int gip_result = libusb_interrupt_transfer(
+        handle_, write_endpoint_, gip.data(), static_cast<int>(gip.size()),
+        nullptr, kTimeoutMs);
+    if (gip_result == LIBUSB_ERROR_NO_DEVICE) {
+      CloseDevice();
+      return X_ERROR_DEVICE_NOT_CONNECTED;
+    }
+    if (gip_result < 0) {
+      REXLOG_WARN("Portal[Write] returned error: {}",
+                  libusb_error_name(gip_result));
+      return X_ERROR_DEVICE_NOT_CONNECTED;
+    }
+    return X_ERROR_SUCCESS;
   }
 
   const size_t send_from = keep_wrapper_ ? 0 : offset;

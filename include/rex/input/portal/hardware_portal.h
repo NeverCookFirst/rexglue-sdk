@@ -29,6 +29,10 @@ struct PortalDeviceId {
   // (<prefix> <len> 55 ...) rather than a bare 0x55 one, so the wrapper the
   // guest sends must be forwarded untouched instead of stripped.
   bool speaks_xbox_frame;
+  // True for the Xbox One pad, which is not a raw pipe at all: every LEGO frame
+  // travels inside a GIP packet (21 00 <seq> 20 ...) and the pad ignores the
+  // gateway until a GIP handshake has been done. See OpenGipGateway.
+  bool speaks_gip = false;
 };
 
 // PDP shipped the ToyPad under two different identities, and they are not the
@@ -37,9 +41,16 @@ struct PortalDeviceId {
 // peripheral (class FF, subclass 5D, protocol 01) that Windows has no inbox
 // driver for at all - Device Manager shows "Driver is unavailable" until a
 // libusb-compatible driver is installed over it with Zadig.
-inline constexpr std::array<PortalDeviceId, 4> kPortalVendorProductIdList = {
+// The Xbox One pad is a third identity again: 0E6F:0141, a GIP device (class FF,
+// subclass 47, protocol D0, compat-id MS_COMP_XGIP10). Windows binds its own
+// xboxgip/dc1-controller stack to it, which exposes no usable channel for LEGO
+// frames, so it too needs a libusb-compatible driver installed with Zadig.
+inline constexpr std::array<PortalDeviceId, 5> kPortalVendorProductIdList = {
     PortalDeviceId{0x0E6F, 0x0241, "LEGO Dimensions ToyPad", false},
     PortalDeviceId{0x24C6, 0xFA01, "LEGO Dimensions ToyPad (Xbox 360)", true},
+    // Speaks the bare 0x55 frame like the PC pad once unwrapped from GIP, so
+    // the guest wrapper is stripped and the GIP header goes on instead.
+    PortalDeviceId{0x0E6F, 0x0141, "LEGO Dimensions ToyPad (Xbox One)", false, true},
     PortalDeviceId{0x1430, 0x1F17, "Skylanders Portal of Power", false},
     // Also an Xbox 360 peripheral, so it gets the same frame policy. Untested.
     PortalDeviceId{0x24C6, 0xFA00, "Disney Infinity Base", true}};
@@ -73,7 +84,17 @@ class HardwarePortal final : public Portal {
   // LIBUSB_ERROR_NOT_FOUND on every transfer.
   bool FindEndpoints(libusb_device_handle* handle);
 
+  // Xbox One pad only. Sends the LEGO wake wrapped in GIP 0x21 and then the
+  // GIP "authenticate complete" packet, which is what actually opens the
+  // gateway, and waits for the pad's wrapped reply. IDENTIFY (0x04) and POWER
+  // (0x05) are deliberately never sent: either one leaves the pad mute until it
+  // is physically unplugged.
+  bool OpenGipGateway();
+  uint8_t NextGipSequence();
+
   static constexpr uint16_t kTimeoutMs = 100;
+  // GIP adds cmd, options, sequence and length in front of the 32-byte frame.
+  static constexpr size_t kGipHeaderSize = 4;
 
   uint8_t read_endpoint_ = 0;
   uint8_t write_endpoint_ = 0;
@@ -90,6 +111,11 @@ class HardwarePortal final : public Portal {
   // Whether to forward the wrapper to the device, resolved in OpenDevice from
   // the device entry and the toypad_passthrough_frame override.
   bool keep_wrapper_ = false;
+
+  // Whether this portal needs the GIP wrapper, and the GIP sequence counter,
+  // which runs 1..255 skipping zero and is independent of the LEGO message id.
+  bool speaks_gip_ = false;
+  uint8_t gip_sequence_ = 1;
 
   libusb_context* context_ = nullptr;
   libusb_device_handle* handle_ = nullptr;

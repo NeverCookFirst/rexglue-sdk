@@ -18,6 +18,9 @@
 
 #include <cstring>
 #include <algorithm>
+#include <cctype>
+#include <functional>
+#include <utility>
 #include <map>
 #include <set>
 #include <string>
@@ -36,7 +39,7 @@ constexpr float kTunedFontSize = 13.0f;
 
 float FontScale() { return std::max(1.0f, ImGui::GetFontSize() / kTunedFontSize); }
 
-float ControlColumnX() { return 240.0f * FontScale(); }
+float ControlColumnX() { return 360.0f * FontScale(); }
 
 }  // namespace
 
@@ -172,13 +175,54 @@ static rex::ui::VirtualKey ImGuiKeyToVirtualKey(ImGuiKey key) {
   }
 }
 
+namespace {
+
+SettingsPresentation& MutablePresentation() {
+  static SettingsPresentation presentation;
+  return presentation;
+}
+
+constexpr const char* kPagePrefix = "page:";
+
+}  // namespace
+
+void SettingsDialog::SetPresentation(SettingsPresentation presentation) {
+  MutablePresentation() = std::move(presentation);
+}
+
+const SettingsPresentation& SettingsDialog::presentation() { return MutablePresentation(); }
+
 void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   auto& registry = rex::cvar::GetRegistry();
+  const SettingsPresentation& pres = presentation();
+  const SettingsStyle& style = imgui_drawer()->style().settings;
 
-  // Collect sorted unique category paths.
+  // Flags a page already shows, and flags hidden outright: neither belongs in
+  // the Advanced tree, or the same setting would be reachable twice.
+  std::set<std::string> presented;
+  for (const auto& page : pres.pages) {
+    for (const auto& item : page.items) {
+      presented.insert(item.cvar);
+    }
+  }
+  std::set<std::string> hidden(pres.hidden.begin(), pres.hidden.end());
+  auto in_advanced = [&](const rex::cvar::FlagEntry& entry) {
+    return !presented.count(entry.name) && !hidden.count(entry.name);
+  };
+
+  // With no pages at all the old behaviour stands: everything is a category.
+  const bool has_pages = !pres.pages.empty();
+  if (selected_category_.empty() && has_pages) {
+    selected_category_ = std::string(kPagePrefix) + pres.pages.front().title;
+  }
+  const bool page_selected = selected_category_.rfind(kPagePrefix, 0) == 0;
+
+  // Collect sorted unique category paths of the flags that go to Advanced.
   std::set<std::string> category_set;
   for (auto& entry : registry) {
-    category_set.insert(entry.category);
+    if (!has_pages || in_advanced(entry)) {
+      category_set.insert(entry.category);
+    }
   }
 
   // Build tree: for each category path like "Input/Keybinds/Controller",
@@ -215,7 +259,9 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   const std::string search(search_buf_);
   const bool searching = !search.empty();
 
-  ImGui::SetNextWindowSize(ImVec2(620.0f * FontScale(), 480.0f * FontScale()),
+  // Wide enough that a sentence-length label and a text field with buttons
+  // sit side by side without the widgets landing on top of the words.
+  ImGui::SetNextWindowSize(ImVec2(960.0f * FontScale(), 600.0f * FontScale()),
                            ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowBgAlpha(0.85f);
   if (!ImGui::Begin("Settings##rex", nullptr, ImGuiWindowFlags_NoCollapse)) {
@@ -225,14 +271,20 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
 
   // Search bar at the top (full width).
   ImGui::SetNextItemWidth(-1.0f);
-  ImGui::InputText("##search", search_buf_, sizeof(search_buf_));
-  ImGui::SameLine(0, 0);
-  ImGui::Dummy(ImVec2(0, 0));
+  ImGui::InputTextWithHint("##search", "Search settings...", search_buf_, sizeof(search_buf_));
 
   ImGui::Separator();
 
-  const float panel_width = 160.0f * FontScale();
+  const float panel_width = 190.0f * FontScale();
   ImGui::BeginChild("##cats", ImVec2(panel_width, -30.0f), true);
+
+  // Player-facing pages first, as a plain list.
+  for (const auto& page : pres.pages) {
+    const std::string key = std::string(kPagePrefix) + page.title;
+    if (ImGui::Selectable(page.title.c_str(), selected_category_ == key)) {
+      selected_category_ = key;
+    }
+  }
 
   // Recursive lambda to draw the category tree.
   std::function<void(const std::map<std::string, CatNode>&, int)> draw_tree;
@@ -267,18 +319,34 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
       }
     }
   };
-  // Root node named after the config file
-  std::string root_label = config_path_.stem().string();
-  ImGuiTreeNodeFlags root_flags = ImGuiTreeNodeFlags_DefaultOpen;
-  if (selected_category_.empty())
-    root_flags |= ImGuiTreeNodeFlags_Selected;
-  bool root_open = ImGui::TreeNodeEx(root_label.c_str(), root_flags);
-  if (ImGui::IsItemClicked()) {
-    selected_category_.clear();
-  }
-  if (root_open) {
-    draw_tree(tree, 1);
-    ImGui::TreePop();
+  if (has_pages) {
+    ImGui::Separator();
+    // Collapsed by default: this is the developer's end of the window.
+    ImGuiTreeNodeFlags adv_flags = ImGuiTreeNodeFlags_OpenOnArrow;
+    if (selected_category_ == "advanced:")
+      adv_flags |= ImGuiTreeNodeFlags_Selected;
+    bool adv_open = ImGui::TreeNodeEx(pres.advanced_title.c_str(), adv_flags);
+    if (ImGui::IsItemClicked()) {
+      selected_category_ = "advanced:";
+    }
+    if (adv_open) {
+      draw_tree(tree, 1);
+      ImGui::TreePop();
+    }
+  } else {
+    // Root node named after the config file
+    std::string root_label = config_path_.stem().string();
+    ImGuiTreeNodeFlags root_flags = ImGuiTreeNodeFlags_DefaultOpen;
+    if (selected_category_.empty())
+      root_flags |= ImGuiTreeNodeFlags_Selected;
+    bool root_open = ImGui::TreeNodeEx(root_label.c_str(), root_flags);
+    if (ImGui::IsItemClicked()) {
+      selected_category_.clear();
+    }
+    if (root_open) {
+      draw_tree(tree, 1);
+      ImGui::TreePop();
+    }
   }
 
   ImGui::EndChild();
@@ -288,7 +356,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   // Helper: check if a CVAR's category matches the selected category.
   // Exact match or prefix match (e.g. selecting "Input" shows all "Input/*").
   auto category_matches = [&](const std::string& cat) -> bool {
-    if (selected_category_.empty())
+    if (selected_category_.empty() || selected_category_ == "advanced:")
       return true;  // Root selected - show all
     if (cat == selected_category_)
       return true;
@@ -313,29 +381,19 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
     return name.rfind("keybind_", 0) == 0 || name.rfind("bind_", 0) == 0;
   };
 
-  ImGui::BeginChild("##cvars", ImVec2(0, -30.0f), false);
-  for (auto& entry : registry) {
-    // Filter by category (unless searching).
-    if (!searching) {
-      if (!category_matches(entry.category)) {
-        continue;
-      }
-    } else {
-      // Search matches name or description (case-insensitive substring).
-      std::string name_lower = entry.name;
-      std::string search_lower = search;
-      auto to_lower = [](std::string& s) {
-        for (auto& c : s)
-          c = static_cast<char>(std::tolower(c));
-      };
-      to_lower(name_lower);
-      to_lower(search_lower);
-      if (name_lower.find(search_lower) == std::string::npos &&
-          entry.description.find(search_lower) == std::string::npos) {
-        continue;
-      }
-    }
+  auto to_lower = [](std::string s) {
+    for (auto& c : s)
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+  };
+  const std::string search_lower = to_lower(search);
 
+  // Draws one settings row. `label` is what the row is called (a page's label,
+  // or the raw flag name under Advanced), `help` what the tooltip says, and
+  // `choices` an optional drop-down replacing the flag's own widget.
+  auto draw_entry = [&](const rex::cvar::FlagEntry& entry, const std::string& label,
+                        const std::string& help,
+                        const std::vector<std::pair<std::string, std::string>>& choices) {
     bool read_only = (entry.lifecycle == rex::cvar::Lifecycle::kInitOnly);
 
     ImGui::PushID(entry.name.c_str());
@@ -345,9 +403,27 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
 
     std::string current_val = entry.getter();
 
-    // Use description as display label if available, otherwise CVAR name
-    const char* display_label =
-        (!entry.description.empty()) ? entry.description.c_str() : entry.name.c_str();
+    const char* lifecycle_label = "";
+    switch (entry.lifecycle) {
+      case rex::cvar::Lifecycle::kHotReload:
+        lifecycle_label = "Applies immediately";
+        break;
+      case rex::cvar::Lifecycle::kRequiresRestart:
+        lifecycle_label = "Takes effect after a restart";
+        break;
+      case rex::cvar::Lifecycle::kInitOnly:
+        lifecycle_label = "Read-only - set at initialization only";
+        break;
+    }
+    auto show_tooltip = [&] {
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        if (!help.empty()) {
+          ImGui::SetTooltip("%s\n[%s]", help.c_str(), lifecycle_label);
+        } else {
+          ImGui::SetTooltip("[%s]", lifecycle_label);
+        }
+      }
+    };
 
     if (is_keybind_category(entry.category) && is_bind_entry(entry.name)) {
       // Controller binds stay editable with MnK mode off, so the layout can be
@@ -357,8 +433,8 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
       if (mnk_off)
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.6f);
 
-      // Show description as label (e.g. "A button"), not the raw CVAR name
-      ImGui::Text("%-20s", entry.description.c_str());
+      ImGui::TextUnformatted(label.c_str());
+      show_tooltip();
       ImGui::SameLine(ControlColumnX());
 
       bool is_capturing = (capturing_bind_name_ == entry.name);
@@ -394,7 +470,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
         }
       } else {
         ImGui::SetNextItemWidth(80.0f * FontScale());
-        ImGui::Text("%-10s", current_val.empty() ? "(none)" : current_val.c_str());
+        ImGui::Text("%-12s", current_val.empty() ? "(none)" : current_val.c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton("Rebind##v")) {
           capturing_bind_name_ = entry.name;
@@ -429,14 +505,14 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
         };
         for (auto& other : registry) {
           if (is_keybind_category(other.category) && is_bind_entry(other.name) &&
-              other.name != entry.name &&
-              other.getter() == current_val && !direction_twins(entry.name, other.name)) {
+              other.name != entry.name && other.getter() == current_val &&
+              !direction_twins(entry.name, other.name)) {
             conflict_count++;
           }
         }
         if (conflict_count > 0) {
           ImGui::SameLine();
-          ImGui::TextColored(imgui_drawer()->style().settings.warning, "(!)");
+          ImGui::TextColored(style.warning, "(!)");
           if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Key '%s' is also bound to %d other action(s)", current_val.c_str(),
                               conflict_count);
@@ -444,119 +520,120 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
         }
       }
 
-      // Skip the generic name + lifecycle badge rendering for keybinds
       if (mnk_off)
         ImGui::PopStyleVar();
       if (read_only)
         ImGui::EndDisabled();
       ImGui::PopID();
-      continue;
-    } else {
-      // Non-keybind CVARs: colored label on left, value widget on right
-      ImGui::TextColored(LifecycleColor(entry.lifecycle, imgui_drawer()->style().settings), "%-20s",
-                         entry.name.c_str());
-      if (ImGui::IsItemHovered()) {
-        const char* lifecycle_label = "";
-        switch (entry.lifecycle) {
-          case rex::cvar::Lifecycle::kHotReload:
-            lifecycle_label = "Live - changes apply immediately";
-            break;
-          case rex::cvar::Lifecycle::kRequiresRestart:
-            lifecycle_label = "Requires restart to take effect";
-            break;
-          case rex::cvar::Lifecycle::kInitOnly:
-            lifecycle_label = "Read-only - set at initialization only";
-            break;
-        }
-        if (!entry.description.empty()) {
-          ImGui::SetTooltip("%s\n[%s]", entry.description.c_str(), lifecycle_label);
-        } else {
-          ImGui::SetTooltip("[%s]", lifecycle_label);
+      return;
+    }
+
+    // Non-keybind CVARs: colored label on left, value widget on right
+    ImGui::TextColored(LifecycleColor(entry.lifecycle, style), "%s", label.c_str());
+    show_tooltip();
+    ImGui::SameLine(ControlColumnX());
+
+    ImGui::SetNextItemWidth(220.0f * FontScale());
+    if (!choices.empty()) {
+      // A page-supplied drop-down: the flag holds the value, the player sees
+      // the label. An unlisted current value is shown raw rather than lost.
+      const char* shown = current_val.c_str();
+      for (const auto& [value, choice_label] : choices) {
+        if (value == current_val) {
+          shown = choice_label.c_str();
+          break;
         }
       }
-      ImGui::SameLine(ControlColumnX());
-
-      ImGui::SetNextItemWidth(160.0f * FontScale());
-      if (entry.type == rex::cvar::FlagType::Boolean) {
-        bool v = rex::string::from_string<bool>(current_val, false);
-        if (ImGui::Checkbox("##v", &v)) {
-          rex::cvar::SetFlagByName(entry.name, v ? "true" : "false");
+      if (ImGui::BeginCombo("##v", shown)) {
+        for (const auto& [value, choice_label] : choices) {
+          bool sel = (value == current_val);
+          if (ImGui::Selectable(choice_label.c_str(), sel)) {
+            rex::cvar::SetFlagByName(entry.name, value);
+          }
+          if (sel)
+            ImGui::SetItemDefaultFocus();
         }
-      } else if (entry.type == rex::cvar::FlagType::String &&
-                 !entry.constraints.allowed_values.empty()) {
-        const auto& opts = entry.constraints.allowed_values;
-        int cur_idx = 0;
+        ImGui::EndCombo();
+      }
+    } else if (entry.type == rex::cvar::FlagType::Boolean) {
+      bool v = rex::string::from_string<bool>(current_val, false);
+      if (ImGui::Checkbox("##v", &v)) {
+        rex::cvar::SetFlagByName(entry.name, v ? "true" : "false");
+      }
+    } else if (entry.type == rex::cvar::FlagType::String &&
+               !entry.constraints.allowed_values.empty()) {
+      const auto& opts = entry.constraints.allowed_values;
+      int cur_idx = 0;
+      for (int i = 0; i < static_cast<int>(opts.size()); ++i) {
+        if (opts[i] == current_val) {
+          cur_idx = i;
+          break;
+        }
+      }
+      if (ImGui::BeginCombo("##v", opts[cur_idx].c_str())) {
         for (int i = 0; i < static_cast<int>(opts.size()); ++i) {
-          if (opts[i] == current_val) {
-            cur_idx = i;
-            break;
+          bool sel = (i == cur_idx);
+          if (ImGui::Selectable(opts[i].c_str(), sel)) {
+            rex::cvar::SetFlagByName(entry.name, opts[i]);
           }
+          if (sel)
+            ImGui::SetItemDefaultFocus();
         }
-        if (ImGui::BeginCombo("##v", opts[cur_idx].c_str())) {
-          for (int i = 0; i < static_cast<int>(opts.size()); ++i) {
-            bool sel = (i == cur_idx);
-            if (ImGui::Selectable(opts[i].c_str(), sel)) {
-              rex::cvar::SetFlagByName(entry.name, opts[i]);
-            }
-            if (sel)
-              ImGui::SetItemDefaultFocus();
-          }
-          ImGui::EndCombo();
-        }
-      } else if (entry.type == rex::cvar::FlagType::Int32 ||
-                 entry.type == rex::cvar::FlagType::Int64 ||
-                 entry.type == rex::cvar::FlagType::Uint32 ||
-                 entry.type == rex::cvar::FlagType::Uint64) {
-        int v = std::atoi(current_val.c_str());
-        int vmin =
-            entry.constraints.min.has_value() ? static_cast<int>(*entry.constraints.min) : INT_MIN;
-        int vmax =
-            entry.constraints.max.has_value() ? static_cast<int>(*entry.constraints.max) : INT_MAX;
-        if (ImGui::InputInt("##v", &v)) {
-          v = std::clamp(v, vmin, vmax);
-          rex::cvar::SetFlagByName(entry.name, std::to_string(v));
-        }
-      } else if (entry.type == rex::cvar::FlagType::Double) {
-        double v = std::atof(current_val.c_str());
-        if (ImGui::InputDouble("##v", &v, 0.0, 0.0, "%.4f")) {
-          if (entry.constraints.min)
-            v = std::max(v, *entry.constraints.min);
-          if (entry.constraints.max)
-            v = std::min(v, *entry.constraints.max);
-          rex::cvar::SetFlagByName(entry.name, std::to_string(v));
-        }
-      } else if (entry.type == rex::cvar::FlagType::Command) {
-        if (ImGui::Button(std::string(entry.name + "##v").c_str())) {
-          entry.command_callback("");
-        }
-      } else {
-        // Refilling the buffer from the cvar every frame undid each keystroke,
-        // so a path could never be typed over: ImGui reloads its edit state
-        // when the caller's buffer changes underneath it. The field being
-        // edited keeps its own buffer instead, and the cvar is written when the
-        // field is left or Enter is pressed - not on every character, which
-        // would apply half-typed paths.
-        const bool editing = (editing_text_name_ == entry.name);
-        char local_buf[sizeof(text_buf_)];
-        char* buf = text_buf_;
-        if (!editing) {
-          buf = local_buf;
-          rex::string::copy_truncating(local_buf, current_val, sizeof(local_buf));
-        }
-        if (ImGui::InputText("##v", buf, sizeof(text_buf_),
-                             ImGuiInputTextFlags_EnterReturnsTrue)) {
-          rex::cvar::SetFlagByName(entry.name, buf);
-        }
-        if (ImGui::IsItemActivated()) {
-          rex::string::copy_truncating(text_buf_, current_val, sizeof(text_buf_));
-          editing_text_name_ = entry.name;
-        } else if (editing && ImGui::IsItemDeactivated()) {
-          // Escape reverts the text before deactivating, so this writes back
-          // what was already there and the setting is unchanged, which is what
-          // Escape should do.
-          rex::cvar::SetFlagByName(entry.name, text_buf_);
-          editing_text_name_.clear();
-        }
+        ImGui::EndCombo();
+      }
+    } else if (entry.type == rex::cvar::FlagType::Int32 ||
+               entry.type == rex::cvar::FlagType::Int64 ||
+               entry.type == rex::cvar::FlagType::Uint32 ||
+               entry.type == rex::cvar::FlagType::Uint64) {
+      int v = std::atoi(current_val.c_str());
+      int vmin =
+          entry.constraints.min.has_value() ? static_cast<int>(*entry.constraints.min) : INT_MIN;
+      int vmax =
+          entry.constraints.max.has_value() ? static_cast<int>(*entry.constraints.max) : INT_MAX;
+      if (ImGui::InputInt("##v", &v)) {
+        v = std::clamp(v, vmin, vmax);
+        rex::cvar::SetFlagByName(entry.name, std::to_string(v));
+      }
+    } else if (entry.type == rex::cvar::FlagType::Double) {
+      double v = std::atof(current_val.c_str());
+      if (ImGui::InputDouble("##v", &v, 0.0, 0.0, "%.4f")) {
+        if (entry.constraints.min)
+          v = std::max(v, *entry.constraints.min);
+        if (entry.constraints.max)
+          v = std::min(v, *entry.constraints.max);
+        rex::cvar::SetFlagByName(entry.name, std::to_string(v));
+      }
+    } else if (entry.type == rex::cvar::FlagType::Command) {
+      if (ImGui::Button(std::string(entry.name + "##v").c_str())) {
+        entry.command_callback("");
+      }
+    } else {
+      // Refilling the buffer from the cvar every frame undid each keystroke,
+      // so a path could never be typed over: ImGui reloads its edit state
+      // when the caller's buffer changes underneath it. The field being
+      // edited keeps its own buffer instead, and the cvar is written when the
+      // field is left or Enter is pressed - not on every character, which
+      // would apply half-typed paths.
+      const bool editing = (editing_text_name_ == entry.name);
+      char local_buf[sizeof(text_buf_)];
+      char* buf = text_buf_;
+      if (!editing) {
+        buf = local_buf;
+        rex::string::copy_truncating(local_buf, current_val, sizeof(local_buf));
+      }
+      ImGui::SetNextItemWidth(-1.0f);
+      if (ImGui::InputText("##v", buf, sizeof(text_buf_), ImGuiInputTextFlags_EnterReturnsTrue)) {
+        rex::cvar::SetFlagByName(entry.name, buf);
+      }
+      if (ImGui::IsItemActivated()) {
+        rex::string::copy_truncating(text_buf_, current_val, sizeof(text_buf_));
+        editing_text_name_ = entry.name;
+      } else if (editing && ImGui::IsItemDeactivated()) {
+        // Escape reverts the text before deactivating, so this writes back
+        // what was already there and the setting is unchanged, which is what
+        // Escape should do.
+        rex::cvar::SetFlagByName(entry.name, text_buf_);
+        editing_text_name_.clear();
       }
     }
 
@@ -564,6 +641,89 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
       ImGui::EndDisabled();
 
     ImGui::PopID();
+  };
+
+  auto find_entry = [&](const std::string& name) -> const rex::cvar::FlagEntry* {
+    for (auto& entry : registry) {
+      if (entry.name == name) {
+        return &entry;
+      }
+    }
+    return nullptr;
+  };
+
+  ImGui::BeginChild("##cvars", ImVec2(0, -30.0f), false);
+  if (searching) {
+    // Search covers everything a person could be looking for: the page label,
+    // the flag name and the description, on the pages and under Advanced.
+    for (const auto& page : pres.pages) {
+      bool titled = false;
+      for (const auto& item : page.items) {
+        const rex::cvar::FlagEntry* entry = find_entry(item.cvar);
+        if (!entry) {
+          continue;
+        }
+        const std::string& help = item.help.empty() ? entry->description : item.help;
+        if (to_lower(item.label).find(search_lower) == std::string::npos &&
+            to_lower(entry->name).find(search_lower) == std::string::npos &&
+            to_lower(help).find(search_lower) == std::string::npos) {
+          continue;
+        }
+        if (!titled) {
+          ImGui::SeparatorText(page.title.c_str());
+          titled = true;
+        }
+        draw_entry(*entry, item.label, help, item.choices);
+      }
+    }
+    bool titled = false;
+    for (auto& entry : registry) {
+      if (has_pages && !in_advanced(entry)) {
+        continue;
+      }
+      if (to_lower(entry.name).find(search_lower) == std::string::npos &&
+          to_lower(entry.description).find(search_lower) == std::string::npos) {
+        continue;
+      }
+      if (has_pages && !titled) {
+        ImGui::SeparatorText(pres.advanced_title.c_str());
+        titled = true;
+      }
+      draw_entry(entry, entry.name, entry.description, {});
+    }
+  } else if (page_selected) {
+    const std::string title = selected_category_.substr(std::strlen(kPagePrefix));
+    for (const auto& page : pres.pages) {
+      if (page.title != title) {
+        continue;
+      }
+      for (const auto& item : page.items) {
+        const rex::cvar::FlagEntry* entry = find_entry(item.cvar);
+        if (!entry) {
+          // A page naming a flag this build does not have is a layout bug,
+          // not a player's problem; say so quietly instead of crashing.
+          ImGui::TextDisabled("%s (not available in this build)", item.label.c_str());
+          continue;
+        }
+        draw_entry(*entry, item.label, item.help.empty() ? entry->description : item.help,
+                   item.choices);
+      }
+      break;
+    }
+  } else {
+    for (auto& entry : registry) {
+      if (has_pages && !in_advanced(entry)) {
+        continue;
+      }
+      if (!category_matches(entry.category)) {
+        continue;
+      }
+      // Under Advanced the flag name is the label: that is what a person will
+      // be asked to change in a bug report, and what the config file says.
+      const bool bind = is_keybind_category(entry.category) && is_bind_entry(entry.name);
+      draw_entry(entry, bind && !entry.description.empty() ? entry.description : entry.name,
+                 entry.description, {});
+    }
   }
   ImGui::EndChild();
 
@@ -604,6 +764,10 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   }
   ImGui::SameLine();
   ImGui::TextDisabled("(%s)", config_path_.filename().string().c_str());
+  ImGui::SameLine();
+  ImGui::TextColored(style.lifecycle_restart, "This colour");
+  ImGui::SameLine();
+  ImGui::TextDisabled("= takes effect after a restart");
 
   ImGui::End();
 }

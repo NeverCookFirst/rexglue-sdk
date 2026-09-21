@@ -30,8 +30,16 @@
 #include <ffx_api/ffx_upscale.h>
 #endif
 
+// Marked as needing a restart because it genuinely does. The flag is baked
+// into the swap chain when it is created, and every later surface change -
+// resizing the window, Alt+Enter - goes through ResizeBuffers, which cannot
+// toggle it (see the comment where ResizeBuffers is called). Changing this and
+// going fullscreen therefore looks like it did nothing, and someone testing a
+// theory about tearing spent an evening on exactly that.
 REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
-                    "Allow variable refresh rate and tearing");
+                    "Allow variable refresh rate and tearing. Takes effect on the next start: the "
+                    "flag is fixed when the swap chain is created.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // Defined in presenter.cpp - same library, shared with any other backend.
 REXCVAR_DECLARE(int32_t, present_max_output_height);

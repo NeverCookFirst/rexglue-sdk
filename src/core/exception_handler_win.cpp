@@ -113,11 +113,45 @@ namespace {
 // that happens: it writes the exception and the faulting address to the log,
 // flushes, and drops a minidump next to the executable so the stack can be
 // read afterwards in a debugger.
+ExceptionHandler::CrashReporter crash_reporter_ = nullptr;
+
+// Kept in its own function because MSVC refuses __try in a function that also
+// has C++ objects to unwind, and the filter below has those.
+bool RunCrashReporterGuarded() {
+  __try {
+    crash_reporter_();
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
 LONG WINAPI LastChanceExceptionFilter(PEXCEPTION_POINTERS ex_info) {
   const EXCEPTION_RECORD* record = ex_info->ExceptionRecord;
+  const uint64_t address = reinterpret_cast<uint64_t>(record->ExceptionAddress);
   REXLOG_CRITICAL("[FATAL] Unhandled exception 0x{:08X} at host 0x{:016X}",
-                  static_cast<uint32_t>(record->ExceptionCode),
-                  reinterpret_cast<uint64_t>(record->ExceptionAddress));
+                  static_cast<uint32_t>(record->ExceptionCode), address);
+  // ASLR moves the executable on every launch, so the raw address above cannot
+  // be looked up in anything. The offset from the module base can - in the
+  // .map or .pdb of the matching build - which is what turns a user's log into
+  // a function name without the dump.
+  HMODULE module = nullptr;
+  if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         reinterpret_cast<LPCWSTR>(address), &module) &&
+      module) {
+    wchar_t module_path[MAX_PATH] = {};
+    GetModuleFileNameW(module, module_path, MAX_PATH);
+    const wchar_t* module_name = wcsrchr(module_path, L'\\');
+    module_name = module_name ? module_name + 1 : module_path;
+    char narrow_name[MAX_PATH] = {};
+    WideCharToMultiByte(CP_UTF8, 0, module_name, -1, narrow_name, MAX_PATH, nullptr, nullptr);
+    REXLOG_CRITICAL("[FATAL] That is {}+0x{:X} (module base 0x{:016X})", narrow_name,
+                    address - reinterpret_cast<uint64_t>(module),
+                    reinterpret_cast<uint64_t>(module));
+  } else {
+    REXLOG_CRITICAL("[FATAL] The faulting address is not inside any loaded module");
+  }
   if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
       record->NumberParameters >= 2) {
     REXLOG_CRITICAL("[FATAL] Access violation: {} of 0x{:016X}",
@@ -126,6 +160,17 @@ LONG WINAPI LastChanceExceptionFilter(PEXCEPTION_POINTERS ex_info) {
   }
   if (auto logger = ::rex::GetLogger()) {
     logger->flush();
+  }
+  if (crash_reporter_) {
+    // Best effort: the reporter reads guest memory and kernel tables that a
+    // crash may itself have corrupted, so a second fault here must not hide
+    // the lines already written - hence the flush above and the guard below.
+    if (!RunCrashReporterGuarded()) {
+      REXLOG_CRITICAL("[FATAL] The guest crash report itself faulted; skipping it");
+    }
+    if (auto logger = ::rex::GetLogger()) {
+      logger->flush();
+    }
   }
 
   // dbghelp is loaded on demand so the runtime keeps no link-time dependency
@@ -186,6 +231,8 @@ void ExceptionHandler::Install(Handler fn, void* data) {
   }
   assert_always("Too many exception handlers installed");
 }
+
+void ExceptionHandler::SetCrashReporter(CrashReporter fn) { crash_reporter_ = fn; }
 
 void ExceptionHandler::Uninstall(Handler fn, void* data) {
   for (size_t i = 0; i < rex::countof(handlers_); ++i) {

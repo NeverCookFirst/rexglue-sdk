@@ -10,7 +10,13 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cstdlib>
+#include <map>
+#include <mutex>
 #include <set>
+#include <string_view>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -60,6 +66,16 @@ REXCVAR_DEFINE_BOOL(readback_resolve_log_sizes, false, "GPU/D3D12",
                     "readback_resolve_max_kb value for a title)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Draws whose pixel shader is on this list are dropped. The use case is a
+// post-process pass a player wants gone (depth of field, say): the title has
+// no switch for it, but every pass is one full-screen draw with its own pixel
+// shader, and the ucode hash identifies that shader on every machine. With the
+// list empty the check is a single branch per draw.
+REXCVAR_DEFINE_STRING(skip_pixel_shaders, "", "GPU",
+                      "Comma-separated ucode hashes (hex) of pixel shaders whose draws "
+                      "are skipped - see the ps_frame and ps_skip console commands")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -76,6 +92,166 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/fxaa_extreme_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_downscale_cs.h"
 }  // namespace shaders
+
+namespace {
+
+// The skip list: the cvar string parsed once per change, plus whatever ps_skip
+// toggled at runtime (which writes the cvar back so the two never disagree).
+// One command processor per process, so file scope is enough; the mutex is for
+// the console thread editing the list while the GPU thread reads it.
+struct PixelShaderSkipList {
+  std::mutex mutex;
+  std::string parsed_from;
+  std::set<uint64_t> hashes;
+
+  void ReparseLocked(const std::string& wanted) {
+    parsed_from = wanted;
+    hashes.clear();
+    size_t at = 0;
+    while (at <= wanted.size()) {
+      size_t next = wanted.find(',', at);
+      if (next == std::string::npos) {
+        next = wanted.size();
+      }
+      std::string token = wanted.substr(at, next - at);
+      token.erase(std::remove_if(token.begin(), token.end(),
+                                 [](unsigned char c) { return std::isspace(c) != 0; }),
+                  token.end());
+      if (!token.empty()) {
+        if (token.rfind("0x", 0) == 0 || token.rfind("0X", 0) == 0) {
+          token.erase(0, 2);
+        }
+        char* end = nullptr;
+        const uint64_t value = std::strtoull(token.c_str(), &end, 16);
+        if (end && *end == '\0') {
+          hashes.insert(value);
+        } else {
+          REXGPU_WARN("skip_pixel_shaders: '{}' is not a hex hash, ignored", token);
+        }
+      }
+      at = next + 1;
+    }
+  }
+
+  bool Contains(uint64_t hash) {
+    const std::string& wanted = REXCVAR_GET(skip_pixel_shaders);
+    std::lock_guard<std::mutex> lock(mutex);
+    if (wanted != parsed_from) {
+      ReparseLocked(wanted);
+    }
+    return hashes.find(hash) != hashes.end();
+  }
+
+  // Returns true when the hash is skipped after the toggle.
+  bool Toggle(uint64_t hash) {
+    std::string next;
+    bool skipped;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      const std::string& wanted = REXCVAR_GET(skip_pixel_shaders);
+      if (wanted != parsed_from) {
+        ReparseLocked(wanted);
+      }
+      if (hashes.erase(hash)) {
+        skipped = false;
+      } else {
+        hashes.insert(hash);
+        skipped = true;
+      }
+      for (uint64_t h : hashes) {
+        if (!next.empty()) {
+          next += ',';
+        }
+        next += fmt::format("{:016X}", h);
+      }
+      parsed_from = next;
+    }
+    rex::cvar::SetFlagByName("skip_pixel_shaders", next);
+    return skipped;
+  }
+};
+
+PixelShaderSkipList& SkipList() {
+  static PixelShaderSkipList list;
+  return list;
+}
+
+// One frame's worth of pixel shaders, collected only while a ps_frame request
+// is armed, so the default cost is one relaxed atomic load per draw.
+struct PixelShaderFrameStats {
+  struct Entry {
+    uint32_t draws = 0;
+    uint32_t min_index_count = UINT32_MAX;
+    uint32_t max_index_count = 0;
+  };
+  std::atomic<bool> armed{false};
+  std::mutex mutex;
+  std::map<uint64_t, Entry> entries;
+
+  void Record(uint64_t hash, uint32_t index_count) {
+    std::lock_guard<std::mutex> lock(mutex);
+    Entry& e = entries[hash];
+    ++e.draws;
+    e.min_index_count = std::min(e.min_index_count, index_count);
+    e.max_index_count = std::max(e.max_index_count, index_count);
+  }
+
+  void Report() {
+    std::lock_guard<std::mutex> lock(mutex);
+    REXGPU_INFO("ps_frame: {} distinct pixel shader(s) this frame. Full-screen passes are the "
+                "ones drawn with 3-6 vertices; ps_skip <hash> drops one, ps_frame again to "
+                "re-list.",
+                entries.size());
+    for (const auto& [hash, e] : entries) {
+      REXGPU_INFO("ps_frame:   {:016X}  draws={:<4} vertices={}..{}{}", hash, e.draws,
+                  e.min_index_count, e.max_index_count,
+                  SkipList().Contains(hash) ? "  [SKIPPED]" : "");
+    }
+    entries.clear();
+  }
+};
+
+PixelShaderFrameStats& FrameStats() {
+  static PixelShaderFrameStats stats;
+  return stats;
+}
+
+uint64_t ParseHashArg(std::string_view args) {
+  size_t begin = args.find_first_not_of(" \t");
+  if (begin == std::string_view::npos) {
+    return 0;
+  }
+  std::string token(args.substr(begin));
+  size_t end = token.find_first_of(" \t");
+  if (end != std::string::npos) {
+    token.resize(end);
+  }
+  if (token.rfind("0x", 0) == 0 || token.rfind("0X", 0) == 0) {
+    token.erase(0, 2);
+  }
+  char* stop = nullptr;
+  const uint64_t value = std::strtoull(token.c_str(), &stop, 16);
+  return (stop && *stop == '\0') ? value : 0;
+}
+
+}  // namespace
+
+REXCVAR_DEFINE_COMMAND(
+    ps_frame, [] { FrameStats().armed.store(true, std::memory_order_release); }, "GPU",
+    "List the pixel shaders used by the next frame, with draw counts");
+
+REXCVAR_DEFINE_COMMAND_ARGS(
+    ps_skip,
+    [](std::string_view args) {
+      const uint64_t hash = ParseHashArg(args);
+      if (!hash) {
+        REXGPU_INFO("ps_skip: usage: ps_skip <hex ucode hash from ps_frame>");
+        return;
+      }
+      const bool skipped = SkipList().Toggle(hash);
+      REXGPU_INFO("ps_skip: {:016X} is now {}", hash, skipped ? "skipped" : "drawn");
+    },
+    "GPU", "Toggle skipping every draw that uses this pixel shader: ps_skip <hex hash>");
 
 D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
                                              system::KernelState* kernel_state)
@@ -1911,6 +2087,9 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  if (FrameStats().armed.exchange(false, std::memory_order_acq_rel)) {
+    FrameStats().Report();
+  }
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -2338,6 +2517,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // cache.
     if (!memexport_used_vertex) {
       // This draw has no effect.
+      return true;
+    }
+  }
+  if (pixel_shader) {
+    if (FrameStats().armed.load(std::memory_order_relaxed)) {
+      FrameStats().Record(pixel_shader->ucode_data_hash(), index_count);
+    }
+    if (!REXCVAR_GET(skip_pixel_shaders).empty() &&
+        SkipList().Contains(pixel_shader->ucode_data_hash())) {
       return true;
     }
   }

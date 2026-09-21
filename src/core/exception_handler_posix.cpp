@@ -419,6 +419,10 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
   }
 }
 
+void ExceptionHandler::SetCrashReporter(CrashReporter) {
+  // No last-chance filter on this platform yet; nothing to attach it to.
+}
+
 void ExceptionHandler::Install(Handler fn, void* data) {
   if (!signal_handlers_installed_) {
     struct sigaction signal_handler;

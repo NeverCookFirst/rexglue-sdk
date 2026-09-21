@@ -529,6 +529,15 @@ class ExceptionHandler {
 
   // Uninstalls a previously-installed exception handler.
   static void Uninstall(Handler fn, void* data);
+
+  // Runs once, from the last-chance filter, after the host-side facts of a
+  // fatal exception have been logged and before the minidump is written. The
+  // host address of a crash is meaningless under ASLR and the minidump rarely
+  // arrives, so this is where a higher layer can say what the *guest* was
+  // doing - which thread, which recompiled function, who called it. Never
+  // invoked on the hot path; a crash is the only trigger.
+  typedef void (*CrashReporter)();
+  static void SetCrashReporter(CrashReporter fn);
 };
 
 }  // namespace rex::arch

@@ -17,6 +17,7 @@
 
 #include <rex/chrono/chrono_steady_cast.h>
 #include <rex/cvar.h>
+#include <rex/exception_handler.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/threading.h>
@@ -462,6 +463,51 @@ namespace {
 // something a person can act on: which thread it is, and where that thread is
 // parked. Best effort - a lock can genuinely be leaked by a thread that has
 // already exited, which is why the caller's message says so.
+// A stack walk would need frame information the recompiler does not keep, so
+// this reads the owner's stack and picks out everything that looks like a
+// return address into guest code. It over-reports - a stale value left in a
+// dead frame looks exactly like a live one - but for the question being asked
+// ("which part of the game fell asleep holding this lock?") a list that
+// contains the answer beats an lr that only ever names the innermost wrapper.
+std::string GuestBacktrace(uint32_t stack_pointer) {
+  // The executable is loaded at 0x82000000; anything outside the image is not a
+  // return address. Keep the window small: deep stacks are noise here.
+  constexpr uint32_t kCodeLow = 0x82000000;
+  constexpr uint32_t kCodeHigh = 0x84000000;
+  constexpr uint32_t kWordsToScan = 128;
+  constexpr size_t kMaxAddresses = 12;
+
+  if (!stack_pointer) {
+    return "(no stack pointer)";
+  }
+  auto* memory = REX_KERNEL_MEMORY();
+  if (!memory) {
+    return "(no memory)";
+  }
+  std::string out;
+  size_t found = 0;
+  uint32_t last = 0;
+  for (uint32_t i = 0; i < kWordsToScan && found < kMaxAddresses; ++i) {
+    const uint32_t address = stack_pointer + i * 4;
+    auto* word = memory->TranslateVirtual<const uint32_t*>(address);
+    if (!word) {
+      break;
+    }
+    const uint32_t value = rex::byte_swap(*word);
+    // Runs of the same address are one call site saved twice, not two frames.
+    if (value < kCodeLow || value >= kCodeHigh || value == last) {
+      continue;
+    }
+    last = value;
+    ++found;
+    if (!out.empty()) {
+      out += " <- ";
+    }
+    out += fmt::format("{:08X}", value);
+  }
+  return out.empty() ? "(nothing that looks like guest code on the stack)" : out;
+}
+
 void DescribeCriticalSectionOwner(uint32_t owner_object) {
   if (!owner_object) {
     return;  // Leaked outright; the message above already says what that means.
@@ -482,6 +528,7 @@ void DescribeCriticalSectionOwner(uint32_t owner_object) {
           "lr is another RtlEnterCriticalSection, the two threads are holding each other.",
           thread->thread_id(), thread->name().empty() ? "unnamed" : thread->name(),
           uint32_t(ctx->lr), uint32_t(ctx->r3.u32));
+      REXKRNL_ERROR("STUCK-LOCK: owner's callers: {}", GuestBacktrace(uint32_t(ctx->r1.u32)));
     } else {
       REXKRNL_ERROR("STUCK-LOCK: the owner is tid {:#06x} ({}), with no context to report.",
                     thread->thread_id(), thread->name().empty() ? "unnamed" : thread->name());
@@ -492,6 +539,37 @@ void DescribeCriticalSectionOwner(uint32_t owner_object) {
       "STUCK-LOCK: no live thread owns object {:#010x} - it exited while holding the lock.",
       owner_object);
 }
+
+// Runs from the last-chance exception filter, once, when the process is
+// already dying. Every fatal crash so far has been in recompiled code, and
+// there the host address says nothing: what identifies the site is the guest
+// thread and the guest return addresses on its stack, which resolve directly
+// to sub_XXXXXXXX in the generated sources. Same walk as the STUCK-LOCK report.
+void ReportGuestCrashContext() {
+  if (!XThread::IsInThread()) {
+    REXKRNL_ERROR("[FATAL] Crashed on a host thread with no guest context");
+    return;
+  }
+  XThread* thread = XThread::GetCurrentThread();
+  auto* thread_state = thread->thread_state();
+  auto* ctx = thread_state ? thread_state->context() : nullptr;
+  if (!ctx) {
+    REXKRNL_ERROR("[FATAL] Crashed on guest tid {:#06x} ({}), with no context to report",
+                  thread->thread_id(), thread->name().empty() ? "unnamed" : thread->name());
+    return;
+  }
+  REXKRNL_ERROR("[FATAL] Crashed on guest tid {:#06x} ({}): lr={:08X} r3={:08X} r1={:08X}",
+                thread->thread_id(), thread->name().empty() ? "unnamed" : thread->name(),
+                uint32_t(ctx->lr), uint32_t(ctx->r3.u32), uint32_t(ctx->r1.u32));
+  REXKRNL_ERROR("[FATAL] Guest callers: {}", GuestBacktrace(uint32_t(ctx->r1.u32)));
+}
+
+// Attached at static-init time so nothing has to remember to wire it up; the
+// filter it feeds is installed later, when the first exception handler is.
+const bool kCrashReporterAttached = [] {
+  rex::arch::ExceptionHandler::SetCrashReporter(&ReportGuestCrashContext);
+  return true;
+}();
 
 }  // namespace
 

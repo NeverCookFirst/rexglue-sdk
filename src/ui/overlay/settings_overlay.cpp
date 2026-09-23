@@ -16,10 +16,15 @@
 #include <rex/ui/keybinds.h>
 #include <imgui.h>
 
+#include <toml++/toml.hpp>
+
 #include <cstring>
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <utility>
 #include <map>
 #include <set>
@@ -38,6 +43,135 @@ namespace {
 constexpr float kTunedFontSize = 13.0f;
 
 float FontScale() { return std::max(1.0f, ImGui::GetFontSize() / kTunedFontSize); }
+
+// Appends code point `cp` to `out` as UTF-8.
+void AppendUtf8(std::string& out, uint32_t cp) {
+  if (cp < 0x80) {
+    out += static_cast<char>(cp);
+  } else if (cp < 0x800) {
+    out += static_cast<char>(0xC0 | (cp >> 6));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  } else if (cp < 0x10000) {
+    out += static_cast<char>(0xE0 | (cp >> 12));
+    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  } else {
+    out += static_cast<char>(0xF0 | (cp >> 18));
+    out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  }
+}
+
+// Reads a JSON string literal starting at text[i] == '"'; leaves i past it.
+// System.Text.Json writes ' and non-ASCII as \uXXXX, so those are decoded.
+bool ReadJsonString(std::string_view text, size_t& i, std::string& out) {
+  if (i >= text.size() || text[i] != '"') return false;
+  ++i;
+  out.clear();
+  auto hex4 = [&](uint32_t& v) {
+    if (i + 4 > text.size()) return false;
+    v = 0;
+    for (int k = 0; k < 4; ++k) {
+      char c = text[i++];
+      v <<= 4;
+      if (c >= '0' && c <= '9') v |= c - '0';
+      else if (c >= 'a' && c <= 'f') v |= c - 'a' + 10;
+      else if (c >= 'A' && c <= 'F') v |= c - 'A' + 10;
+      else return false;
+    }
+    return true;
+  };
+  while (i < text.size()) {
+    char c = text[i++];
+    if (c == '"') return true;
+    if (c != '\\') { out += c; continue; }
+    if (i >= text.size()) return false;
+    char e = text[i++];
+    switch (e) {
+      case 'n': out += '\n'; break;
+      case 't': out += '\t'; break;
+      case 'r': out += '\r'; break;
+      case 'b': out += '\b'; break;
+      case 'f': out += '\f'; break;
+      case 'u': {
+        uint32_t cp;
+        if (!hex4(cp)) return false;
+        if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < text.size() && text[i] == '\\' &&
+            text[i + 1] == 'u') {
+          i += 2;
+          uint32_t lo;
+          if (!hex4(lo)) return false;
+          cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+        }
+        AppendUtf8(out, cp);
+        break;
+      }
+      default: out += e; break;  // \" \\ \/
+    }
+  }
+  return false;
+}
+
+// The settings the installer (or the last update) wrote into the config, read
+// from the "TomlWritten" map in install.json: cvar name -> TOML literal. That
+// map holds the paths and the compatibility switches the game cannot start
+// without, which is what "defaults" has to mean for an installed game.
+std::vector<std::pair<std::string, std::string>> ReadInstallerSettings(
+    const std::filesystem::path& install_json) {
+  std::vector<std::pair<std::string, std::string>> result;
+  std::ifstream file(install_json, std::ios::binary);
+  if (!file) return result;
+  std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  // The installer serializes with a camelCase naming policy.
+  size_t i = text.find("\"tomlWritten\"");
+  if (i == std::string::npos) i = text.find("\"TomlWritten\"");
+  if (i == std::string::npos) return result;
+  i = text.find('{', i);
+  if (i == std::string::npos) return result;
+  ++i;
+  auto skip_ws = [&] {
+    while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i]))) ++i;
+  };
+  std::string key, literal;
+  for (;;) {
+    skip_ws();
+    if (i >= text.size() || text[i] == '}') break;
+    if (!ReadJsonString(text, i, key)) break;
+    skip_ws();
+    if (i >= text.size() || text[i] != ':') break;
+    ++i;
+    skip_ws();
+    if (!ReadJsonString(text, i, literal)) break;
+    // The literal is TOML ('d3d12', true, 256); the TOML parser turns it into
+    // the plain string form the cvar setters take.
+    try {
+      auto parsed = toml::parse("v = " + literal);
+      const toml::node* v = parsed.get("v");
+      std::string value;
+      bool ok = v != nullptr;
+      if (!ok) {
+      } else if (v->is_boolean()) {
+        value = v->as_boolean()->get() ? "true" : "false";
+      } else if (v->is_integer()) {
+        value = std::to_string(v->as_integer()->get());
+      } else if (v->is_floating_point()) {
+        value = std::to_string(v->as_floating_point()->get());
+      } else if (v->is_string()) {
+        value = v->as_string()->get();
+      } else {
+        ok = false;
+      }
+      if (ok && !key.empty()) {
+        result.emplace_back(key, value);
+      }
+    } catch (const toml::parse_error&) {
+    }
+    skip_ws();
+    if (i < text.size() && text[i] == ',') ++i;
+  }
+  return result;
+}
 
 float ControlColumnX() { return 360.0f * FontScale(); }
 
@@ -743,22 +877,28 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   }
   if (ImGui::BeginPopupModal("Reset all settings?", nullptr,
                              ImGuiWindowFlags_AlwaysAutoResize)) {
-    ImGui::TextUnformatted("Every setting and keybind goes back to its default value (data paths are kept),");
+    ImGui::TextUnformatted("Every setting and keybind goes back to how the installer set it up,");
     ImGui::TextUnformatted("and the config file is overwritten with them.");
     ImGui::TextUnformatted("Settings marked as restart-only apply on the next start.");
     ImGui::Separator();
     if (ImGui::Button("Reset")) {
-      // Paths (game_data_root and friends) are where the installer pointed
-      // the game, not preferences - resetting them leaves a game that cannot
-      // find its own data. Carry every *_root over the reset.
-      std::vector<std::pair<std::string, std::string>> kept_paths;
+      // The engine's own defaults are not a working game: the installer
+      // writes paths, the log file and compatibility switches (d3d12,
+      // invalid_function_nonfatal, license_mask...) without which it crashes
+      // on start. Reset to what the installer wrote, falling back to carrying
+      // the current paths over when there is no install.json (a dev build).
+      auto installer = ReadInstallerSettings(config_path_.parent_path() / "install.json");
+      std::vector<std::pair<std::string, std::string>> kept;
       for (const auto& name : rex::cvar::ListFlags()) {
-        if (name.size() > 5 && name.ends_with("_root")) {
-          kept_paths.emplace_back(name, rex::cvar::GetFlagByName(name));
+        if (name.ends_with("_root") || name.ends_with("_path") || name.ends_with("_file")) {
+          kept.emplace_back(name, rex::cvar::GetFlagByName(name));
         }
       }
       rex::cvar::ResetAllToDefaults();
-      for (const auto& [name, value] : kept_paths) {
+      for (const auto& [name, value] : kept) {
+        rex::cvar::SetFlagByName(name, value);
+      }
+      for (const auto& [name, value] : installer) {
         rex::cvar::SetFlagByName(name, value);
       }
       rex::cvar::SaveConfig(config_path_);

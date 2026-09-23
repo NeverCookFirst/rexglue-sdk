@@ -171,6 +171,12 @@ class CommandProcessor {
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
+  // Called before a packet that writes guest memory or signals the guest
+  // (fences, interrupts, queries), so work deferred for speed - like batched
+  // memexport readbacks - lands before the guest can look at it.
+  virtual void OnGuestVisibleWrite(const char* why) {}
+  // The GPU is about to read this guest physical address (WAIT_REG_MEM).
+  virtual void OnGuestMemoryPoll(uint32_t physical_address) {}
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);

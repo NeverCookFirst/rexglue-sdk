@@ -35,6 +35,8 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
+#include "frame_stats.h"
+
 // Off by default and locked (kInitOnly), so the settings UI greys it out and
 // nothing can flip it at runtime.
 //
@@ -248,6 +250,7 @@ void CommandProcessor::WorkerThreadMain() {
     uint32_t write_ptr_index = write_ptr_index_.load();
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
+      frame_stats::Scope idle_scope(frame_stats::kCpIdle);
       // We've run out of commands to execute.
       // Ported from TheSimpsonsGameRecomp's SDK fork: the old policy was 500
       // sched-yield spins before ever touching the event, then a 5 ms timed
@@ -964,6 +967,8 @@ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32
 
 bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, uint32_t packet,
                                                     uint32_t count) {
+  // The guest can observe GPU results from here on: land deferred readbacks.
+  OnGuestVisibleWrite("INTERRUPT");
   SCOPE_profile_cpu_f("gpu");
 
   // generate interrupt from the command stream
@@ -1089,6 +1094,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   uint32_t wait = reader->ReadAndSwap<uint32_t>();
 
   bool is_memory = (wait_info & 0x10) != 0;
+  // Only the GPU waits here, the guest learns nothing - but the polled word may
+  // be one a deferred readback is about to overwrite. (A real wait below goes
+  // through PrepareForWait, which lands everything anyway.)
+  if (is_memory) {
+    OnGuestMemoryPoll(poll_reg_addr & ~uint32_t(0x3));
+  }
 
   bool matched = false;
   do {
@@ -1196,6 +1207,8 @@ bool CommandProcessor::ExecutePacketType3_REG_RMW(memory::RingBuffer* reader, ui
 
 bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader, uint32_t packet,
                                                      uint32_t count) {
+  // The guest can observe GPU results from here on: land deferred readbacks.
+  OnGuestVisibleWrite("REG_TO_MEM");
   // Copy Register to Memory (?)
   // Count is 2, assuming a Register Addr and a Memory Addr.
 
@@ -1214,6 +1227,8 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
 
 bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, uint32_t packet,
                                                     uint32_t count) {
+  // The guest can observe GPU results from here on: land deferred readbacks.
+  OnGuestVisibleWrite("MEM_WRITE");
   uint32_t write_addr = reader->ReadAndSwap<uint32_t>();
   for (uint32_t i = 0; i < count - 1; i++) {
     uint32_t write_data = reader->ReadAndSwap<uint32_t>();
@@ -1230,6 +1245,8 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
 
 bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader, uint32_t packet,
                                                      uint32_t count) {
+  // The guest can observe GPU results from here on: land deferred readbacks.
+  OnGuestVisibleWrite("COND_WRITE");
   // conditional write to memory or register
   uint32_t wait_info = reader->ReadAndSwap<uint32_t>();
   uint32_t poll_reg_addr = reader->ReadAndSwap<uint32_t>();
@@ -1309,6 +1326,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE(memory::RingBuffer* reader
 
 bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* reader,
                                                           uint32_t packet, uint32_t count) {
+  // The guest can observe GPU results from here on: land deferred readbacks.
+  OnGuestVisibleWrite("EVENT_WRITE_SHD");
   // generate a VS|PS_done event
   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
   uint32_t address = reader->ReadAndSwap<uint32_t>();
@@ -1333,6 +1352,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
 
 bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* reader,
                                                           uint32_t packet, uint32_t count) {
+  // The guest can observe GPU results from here on: land deferred readbacks.
+  OnGuestVisibleWrite("EVENT_WRITE_EXT");
   // generate a screen extent event
   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
   uint32_t address = reader->ReadAndSwap<uint32_t>();
@@ -1361,6 +1382,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
 
 bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
                                                           uint32_t packet, uint32_t count) {
+  // The guest can observe GPU results from here on: land deferred readbacks.
+  OnGuestVisibleWrite("EVENT_WRITE_ZPD");
   // Set by D3D as BE but struct ABI is LE
   const uint32_t kQueryFinished = rex::byte_swap(0xFFFFFEED);
   assert_true(count == 1);

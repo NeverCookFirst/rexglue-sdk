@@ -10,6 +10,7 @@
  */
 
 #include "thirdparty/dxbc/DXBCChecksum.h"
+#include "../frame_stats.h"
 
 #include <algorithm>
 #include <atomic>
@@ -928,6 +929,7 @@ bool PipelineCache::ConfigurePipeline(
   if (!vertex_shader->is_translated() && !use_async) {
     std::lock_guard<std::mutex> lock(translation_request_lock_);
     if (!vertex_shader->is_translated()) {
+      frame_stats::Scope translate_scope(frame_stats::kShaderTranslate);
       if (!TranslateAnalyzedShader(*shader_translator_, *vertex_shader, dxbc_converter_, dxc_utils_,
                                    dxc_compiler_)) {
         REXGPU_ERROR("Failed to translate the vertex shader!");
@@ -955,6 +957,7 @@ bool PipelineCache::ConfigurePipeline(
       std::lock_guard<std::mutex> lock(translation_request_lock_);
       if (!pixel_shader->is_translated()) {
         pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
+        frame_stats::Scope translate_scope(frame_stats::kShaderTranslate);
         if (!TranslateAnalyzedShader(*shader_translator_, *pixel_shader, dxbc_converter_,
                                      dxc_utils_, dxc_compiler_)) {
           REXGPU_ERROR("Failed to translate the pixel shader!");
@@ -1008,6 +1011,7 @@ bool PipelineCache::ConfigurePipeline(
     }
   }
   PROFILE_PIPELINE_CACHE_MISS();
+  frame_stats::Add(frame_stats::kPipelineMiss, 0);
 
   Pipeline* new_pipeline = new Pipeline;
   std::memcpy(&new_pipeline->description, &runtime_description, sizeof(runtime_description));
@@ -1033,6 +1037,7 @@ bool PipelineCache::ConfigurePipeline(
     }
     creation_request_cond_.notify_one();
   } else {
+    frame_stats::Scope create_scope(frame_stats::kPipelineCreate);
     new_pipeline->state.store(CreateD3D12Pipeline(runtime_description), std::memory_order_release);
   }
 

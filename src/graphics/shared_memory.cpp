@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include "frame_stats.h"
 #include <cstring>
 #include <utility>
 
@@ -490,6 +491,8 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     return std::make_pair(uint32_t(0), UINT32_MAX);
   }
   length = std::min(length, kBufferSize - physical_address_start);
+  // Runs on the game thread that faulted writing GPU-watched memory.
+  frame_stats::Add(frame_stats::kMemoryInvalidate, 0, length);
   uint32_t physical_address_last = physical_address_start + (length - 1);
 
   uint32_t page_first = physical_address_start >> page_size_log2_;

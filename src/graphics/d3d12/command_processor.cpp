@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include "../frame_stats.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -61,6 +63,14 @@ REXCVAR_DEFINE_UINT32(readback_resolve_max_kb, 0, "GPU/D3D12",
                       "The resolve itself still happens; only the copy to the CPU is "
                       "skipped.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(readback_memexport_batched, true, "GPU/D3D12",
+                    "With memexport readback on and the fast path off, queue each draw's "
+                    "readback and sync with the GPU once, when the guest can observe the "
+                    "results, instead of after every draw");
+REXCVAR_DEFINE_UINT32(slow_frame_log_ms, 0, "GPU/D3D12",
+                      "Log a breakdown of every frame slower than this many milliseconds "
+                      "(0 = off): GPU-thread idle, host GPU waits, shader/pipeline work, "
+                      "texture loads, readbacks");
 REXCVAR_DEFINE_BOOL(readback_resolve_log_sizes, false, "GPU/D3D12",
                     "Log the size of each distinct readback resolve once (to pick a "
                     "readback_resolve_max_kb value for a title)")
@@ -214,6 +224,51 @@ struct PixelShaderFrameStats {
 PixelShaderFrameStats& FrameStats() {
   static PixelShaderFrameStats stats;
   return stats;
+}
+
+// Called on every swap from the command thread: if the frame that just ended
+// took longer than slow_frame_log_ms, log what the command thread spent it on.
+// Idle time is the tell: a slow frame the command thread mostly idled through
+// was slow on the game's side (its code, file loading), not in GPU emulation.
+void ReportSlowFrame() {
+  using clock = std::chrono::steady_clock;
+  static clock::time_point last_swap{};
+  static uint64_t frame_index = 0;
+  const clock::time_point now = clock::now();
+  const uint32_t threshold_ms = REXCVAR_GET(slow_frame_log_ms);
+  // Take and reset the counters every frame, so a slow frame reports only itself.
+  struct Snap {
+    uint64_t count, us, extra;
+  };
+  std::array<Snap, frame_stats::kCount> s;
+  for (uint32_t i = 0; i < frame_stats::kCount; ++i) {
+    auto& c = frame_stats::Counters()[i];
+    s[i] = {c.count.exchange(0, std::memory_order_relaxed),
+            c.us.exchange(0, std::memory_order_relaxed),
+            c.extra.exchange(0, std::memory_order_relaxed)};
+  }
+  const bool first = last_swap == clock::time_point{};
+  const uint64_t frame_us =
+      first ? 0
+            : std::chrono::duration_cast<std::chrono::microseconds>(now - last_swap).count();
+  last_swap = now;
+  ++frame_index;
+  if (!threshold_ms || first || frame_us < uint64_t(threshold_ms) * 1000) {
+    return;
+  }
+  auto ms = [](uint64_t us) { return double(us) / 1000.0; };
+  using namespace frame_stats;
+  REXGPU_INFO(
+      "slow frame #{}: {:.1f} ms | gpu-thread idle {:.1f} | host-gpu wait {:.1f} ({}x) | "
+      "shader translate {:.1f} ({}x) | pipeline create {:.1f} ({}x), new {} | "
+      "texture load {:.1f} ({}x) | readback {}x {} KB, {} stalled | "
+      "cpu-write invalidations {}x {} KB | memexport syncs {} ({} KB)",
+      frame_index, ms(frame_us), ms(s[kCpIdle].us), ms(s[kFenceWait].us), s[kFenceWait].count,
+      ms(s[kShaderTranslate].us), s[kShaderTranslate].count, ms(s[kPipelineCreate].us),
+      s[kPipelineCreate].count, s[kPipelineMiss].count, ms(s[kTextureLoad].us),
+      s[kTextureLoad].count, s[kReadbackResolve].count, s[kReadbackResolve].extra / 1024,
+      s[kReadbackResolve].us, s[kMemoryInvalidate].count, s[kMemoryInvalidate].extra / 1024,
+      s[kMemexportFlush].count, s[kMemexportFlush].extra / 1024);
 }
 
 uint64_t ParseHashArg(std::string_view args) {
@@ -1825,6 +1880,10 @@ void D3D12CommandProcessor::ShutdownContext() {
   ShutdownOcclusionQueryResources();
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
+  ui::d3d12::util::ReleaseAndNull(memexport_batch_buffer_);
+  memexport_batch_capacity_ = 0;
+  memexport_batch_used_ = 0;
+  memexport_batch_ranges_.clear();
   readback_buffer_size_ = 0;
   for (auto& resolve_readback_pair : readback_buffers_) {
     auto& readback = resolve_readback_pair.second;
@@ -2090,6 +2149,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   if (FrameStats().armed.exchange(false, std::memory_order_acq_rel)) {
     FrameStats().Report();
   }
+  FlushMemexportReadbackBatch("swap");
+  ReportSlowFrame();
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -2925,6 +2986,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       if (memexport_total_size != 0) {
         if (REXCVAR_GET(readback_memexport_fast)) {
           IssueDraw_MemexportReadbackFastPath(memexport_total_size);
+        } else if (REXCVAR_GET(readback_memexport_batched)) {
+          IssueDraw_MemexportReadbackBatched(memexport_total_size);
         } else {
           IssueDraw_MemexportReadbackFullPath(memexport_total_size);
         }
@@ -2935,7 +2998,108 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   return true;
 }
 
+bool D3D12CommandProcessor::IssueDraw_MemexportReadbackBatched(uint32_t total_size) {
+  if (!total_size || memexport_ranges_.empty()) {
+    return true;
+  }
+  // The copies below go into the buffer after whatever is already queued; a
+  // bigger buffer cannot be swapped in under queued copies, so land those first.
+  if (memexport_batch_used_ + total_size > memexport_batch_capacity_) {
+    FlushMemexportReadbackBatch("buffer full");
+    if (total_size > memexport_batch_capacity_) {
+      uint32_t capacity = rex::align(std::max(total_size * 2, uint32_t(1) << 20),
+                                     kReadbackBufferSizeIncrement);
+      const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+      D3D12_RESOURCE_DESC buffer_desc;
+      ui::d3d12::util::FillBufferResourceDesc(buffer_desc, capacity, D3D12_RESOURCE_FLAG_NONE);
+      ID3D12Resource* buffer = nullptr;
+      if (FAILED(provider.GetDevice()->CreateCommittedResource(
+              &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
+              &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
+        REXGPU_ERROR("Failed to create a {} KB memexport readback buffer", capacity >> 10);
+        return IssueDraw_MemexportReadbackFullPath(total_size);
+      }
+      ui::d3d12::util::ReleaseAndNull(memexport_batch_buffer_);
+      memexport_batch_buffer_ = buffer;
+      memexport_batch_capacity_ = capacity;
+    }
+  }
+
+  shared_memory_->UseAsCopySource();
+  SubmitBarriers();
+  ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
+  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    deferred_command_list_.D3DCopyBufferRegion(
+        memexport_batch_buffer_, memexport_batch_used_, shared_memory_buffer,
+        memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
+    memexport_batch_ranges_.emplace_back(memexport_range.base_address_dwords << 2,
+                                         memexport_range.size_bytes);
+    memexport_batch_used_ += memexport_range.size_bytes;
+  }
+  return true;
+}
+
+void D3D12CommandProcessor::FlushMemexportReadbackBatch(const char* why) {
+  if (memexport_batch_ranges_.empty()) {
+    return;
+  }
+  if (REXCVAR_GET(slow_frame_log_ms)) {
+    // Which packets force the syncs: summed and logged every 5 s.
+    static std::map<std::string, uint64_t> reasons;
+    static auto last = std::chrono::steady_clock::now();
+    ++reasons[why];
+    auto now = std::chrono::steady_clock::now();
+    if (now - last > std::chrono::seconds(5)) {
+      std::string line;
+      for (const auto& [name, n] : reasons) line += fmt::format(" {}={}", name, n);
+      REXGPU_INFO("memexport flush reasons (5 s):{}", line);
+      reasons.clear();
+      last = now;
+    }
+  }
+  frame_stats::Add(frame_stats::kMemexportFlush, 0, memexport_batch_used_);
+  if (AwaitAllQueueOperationsCompletion()) {
+    D3D12_RANGE read_range = {0, memexport_batch_used_};
+    void* mapping = nullptr;
+    if (SUCCEEDED(memexport_batch_buffer_->Map(0, &read_range, &mapping))) {
+      // In queue order, so a later draw's export of the same range wins, as it
+      // did when each draw was synced on its own.
+      const uint8_t* bytes = static_cast<const uint8_t*>(mapping);
+      for (const auto& [address, size] : memexport_batch_ranges_) {
+        std::memcpy(memory_->TranslatePhysical(address), bytes, size);
+        bytes += size;
+      }
+      D3D12_RANGE write_range = {};
+      memexport_batch_buffer_->Unmap(0, &write_range);
+    }
+  }
+  memexport_batch_ranges_.clear();
+  memexport_batch_used_ = 0;
+}
+
+void D3D12CommandProcessor::OnGuestMemoryPoll(uint32_t physical_address) {
+  physical_address &= 0x1FFFFFFF;
+  for (const auto& [address, size] : memexport_batch_ranges_) {
+    if (physical_address - (address & 0x1FFFFFFF) < size) {
+      FlushMemexportReadbackBatch("WAIT_REG_MEM on exported memory");
+      return;
+    }
+  }
+}
+
+void D3D12CommandProcessor::OnGuestVisibleWrite(const char* why) {
+  FlushMemexportReadbackBatch(why);
+}
+
+void D3D12CommandProcessor::PrepareForWait() {
+  // Out of commands (or about to spin on guest memory): nothing later in the
+  // ring can land the queue, and the guest may be waiting on the results.
+  FlushMemexportReadbackBatch("idle/wait");
+  CommandProcessor::PrepareForWait();
+}
+
 bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
+  frame_stats::Add(frame_stats::kMemexportFlush, 0, total_size);
   if (!total_size || memexport_ranges_.empty()) {
     return true;
   }
@@ -3309,6 +3473,9 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     }
   }
 
+  // For readbacks the "us" slot counts cache misses: those stalled on the GPU
+  // above, and that time lands in kFenceWait.
+  frame_stats::Add(frame_stats::kReadbackResolve, is_cache_miss ? 1 : 0, written_length);
   bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
   if (should_copy && rb.buffers[read_index] && written_length <= rb.sizes[read_index] &&
       rb.mapped_data[read_index]) {
@@ -3338,7 +3505,10 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
                     SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
                         fence_value, fence_completion_event_)))) {
         PROFILE_CMD_BUFFER_STALL();
-        WaitForSingleObject(fence_completion_event_, INFINITE);
+        {
+          frame_stats::Scope fence_scope(frame_stats::kFenceWait);
+          WaitForSingleObject(fence_completion_event_, INFINITE);
+        }
         queue_operations_done_since_submission_signal_ = false;
       } else {
         REXGPU_ERROR(
@@ -3357,7 +3527,10 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     if (SUCCEEDED(
             submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
       PROFILE_CMD_BUFFER_STALL();
-      WaitForSingleObject(fence_completion_event_, INFINITE);
+      {
+        frame_stats::Scope fence_scope(frame_stats::kFenceWait);
+        WaitForSingleObject(fence_completion_event_, INFINITE);
+      }
       submission_completed_ = submission_fence_->GetCompletedValue();
     }
   }

@@ -211,6 +211,10 @@ class D3D12CommandProcessor : public CommandProcessor {
                  uint32_t frontbuffer_height) override;
 
   void OnPrimaryBufferEnd() override;
+  void OnGuestVisibleWrite(const char* why) override;
+  void OnGuestMemoryPoll(uint32_t physical_address) override;
+  void FlushMemexportReadbackBatch(const char* why);
+  void PrepareForWait() override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -368,6 +372,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool IssueCopy_ReadbackResolvePath();
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+  // Batched memexport readback: queue the copy, sync once when the guest can
+  // observe it (see OnGuestVisibleWrite) instead of after every draw.
+  bool IssueDraw_MemexportReadbackBatched(uint32_t total_size);
+
 
   // Returns a buffer for reading GPU data back to the CPU. Assuming
   // synchronizing immediately after use. Always in COPY_DEST state.
@@ -645,6 +653,11 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   ID3D12Resource* readback_buffer_ = nullptr;
   uint32_t readback_buffer_size_ = 0;
+  ID3D12Resource* memexport_batch_buffer_ = nullptr;
+  uint32_t memexport_batch_capacity_ = 0;
+  uint32_t memexport_batch_used_ = 0;
+  // Guest physical address and size of each queued range, in buffer order.
+  std::vector<std::pair<uint32_t, uint32_t>> memexport_batch_ranges_;
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 

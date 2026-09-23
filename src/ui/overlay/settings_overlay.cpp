@@ -261,7 +261,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
 
   // Wide enough that a sentence-length label and a text field with buttons
   // sit side by side without the widgets landing on top of the words.
-  ImGui::SetNextWindowSize(ImVec2(960.0f * FontScale(), 600.0f * FontScale()),
+  ImGui::SetNextWindowSize(ImVec2(820.0f * FontScale(), 520.0f * FontScale()),
                            ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowBgAlpha(0.85f);
   if (!ImGui::Begin("Settings##rex", nullptr, ImGuiWindowFlags_NoCollapse)) {

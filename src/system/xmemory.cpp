@@ -133,6 +133,10 @@ Memory::~Memory() {
 
 bool Memory::Initialize() {
   file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
+  // A breadcrumb: the arena is the first thing that can fail for reasons
+  // outside the game (address space, page file, a hook DLL squatting on the
+  // range), and a log that ends right before it says where to look.
+  REXSYS_INFO("Reserving the guest memory arena...");
 
   // Create main page file-backed mapping. This is all reserved but
   // uncommitted (so it shouldn't expand page file).
@@ -143,7 +147,8 @@ bool Memory::Initialize() {
   mapping_ = rex::memory::CreateFileMappingHandle(file_name_, mapping_size,
                                                   rex::memory::PageAccess::kReadWrite, false);
   if (mapping_ == rex::memory::kFileMappingHandleInvalid) {
-    REXSYS_ERROR("Unable to reserve the 4gb guest address space.");
+    REXSYS_ERROR("Unable to reserve the 4gb guest address space (mapping of {} MB failed, OS error {}).",
+                 mapping_size >> 20, rex::memory::LastOsError());
     assert_always();
     return false;
   }
@@ -169,7 +174,8 @@ bool Memory::Initialize() {
     }
   }
   if (!mapping_base_) {
-    REXSYS_ERROR("Unable to find a continuous block in the 64bit address space.");
+    REXSYS_ERROR("Unable to find a continuous block in the 64bit address space (OS error {}).",
+                 rex::memory::LastOsError());
     assert_always();
     return false;
   }

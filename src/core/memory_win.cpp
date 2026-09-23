@@ -170,6 +170,8 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
   return true;
 }
 
+uint32_t LastOsError() { return static_cast<uint32_t>(GetLastError()); }
+
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
                                           PageAccess access, bool commit) {
   DWORD protect = ToWin32ProtectFlags(access) | (commit ? SEC_COMMIT : SEC_RESERVE);

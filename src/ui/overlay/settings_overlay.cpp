@@ -743,12 +743,24 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   }
   if (ImGui::BeginPopupModal("Reset all settings?", nullptr,
                              ImGuiWindowFlags_AlwaysAutoResize)) {
-    ImGui::TextUnformatted("Every setting and keybind goes back to its default value,");
+    ImGui::TextUnformatted("Every setting and keybind goes back to its default value (data paths are kept),");
     ImGui::TextUnformatted("and the config file is overwritten with them.");
     ImGui::TextUnformatted("Settings marked as restart-only apply on the next start.");
     ImGui::Separator();
     if (ImGui::Button("Reset")) {
+      // Paths (game_data_root and friends) are where the installer pointed
+      // the game, not preferences - resetting them leaves a game that cannot
+      // find its own data. Carry every *_root over the reset.
+      std::vector<std::pair<std::string, std::string>> kept_paths;
+      for (const auto& name : rex::cvar::ListFlags()) {
+        if (name.size() > 5 && name.ends_with("_root")) {
+          kept_paths.emplace_back(name, rex::cvar::GetFlagByName(name));
+        }
+      }
       rex::cvar::ResetAllToDefaults();
+      for (const auto& [name, value] : kept_paths) {
+        rex::cvar::SetFlagByName(name, value);
+      }
       rex::cvar::SaveConfig(config_path_);
       // Anything half-typed or half-rebound refers to a value that just
       // changed underneath it.

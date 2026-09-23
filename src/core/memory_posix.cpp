@@ -429,6 +429,8 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
 #endif
 }
 
+uint32_t LastOsError() { return static_cast<uint32_t>(errno); }
+
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
                                           PageAccess access, bool commit) {
 #if REX_PLATFORM_ANDROID

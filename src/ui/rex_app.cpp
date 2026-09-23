@@ -116,6 +116,9 @@ bool ReXApp::OnInitialize() {
     return stats;
   });
 
+  // Breadcrumbs for a launch that dies before the runtime exists: a log that
+  // stops at one of these names the step, which nothing else would.
+  REXLOG_INFO("Startup: resolving paths");
   auto paths = OnFinalizePaths(resolved_defaults_, MakeResumeCallback());
   if (!paths) {
     // Async: consumer will invoke resume when ready. OnInitialize returns
@@ -123,8 +126,10 @@ bool ReXApp::OnInitialize() {
     return true;
   }
 
+  REXLOG_INFO("Startup: constructing the runtime");
   if (!ConstructRuntime(*paths))
     return false;
+  REXLOG_INFO("Startup: launching the module");
   LaunchModule();
   return true;
 }
@@ -411,6 +416,7 @@ bool ReXApp::SetupPresentation() {
       }
     }
     window_->SetPresenter(presenter);
+    REXLOG_INFO("Startup: presenter attached to the window");
   } else if (!graphics_system) {
     // Detached mode: the app brings its own renderer and drives its own paint
     // loop. ReXApp owns the returned drawer via immediate_drawer_.
@@ -435,6 +441,7 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
   // lazily on the first Draw instead).
   imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
+  REXLOG_INFO("Startup: overlays ready");
   rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
     if (debug_overlay_) {
       debug_overlay_.reset();
@@ -495,6 +502,7 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   });
 
   OnCreateDialogs(imgui_drawer_.get());
+  REXLOG_INFO("Startup: dialogs registered");
 }
 
 void ReXApp::LaunchModule() {

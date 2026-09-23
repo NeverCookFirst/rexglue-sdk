@@ -145,6 +145,10 @@ void AlignedFree(T* ptr) {
 using FileMappingHandle = intptr_t;
 constexpr FileMappingHandle kFileMappingHandleInvalid = -1;
 
+// The OS's last error code (GetLastError / errno), for the log line that
+// explains why a mapping or reservation failed.
+uint32_t LastOsError();
+
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
                                           PageAccess access, bool commit);
 void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path);

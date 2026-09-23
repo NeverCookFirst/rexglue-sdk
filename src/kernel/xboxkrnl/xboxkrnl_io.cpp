@@ -30,6 +30,16 @@
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
 
+// Reads inside an archive are the only trace of which archive served a file:
+// the game opens every DAT once and then reads by offset, so an open trace
+// says nothing about lookups. With the filter naming an archive (a substring
+// of its path, comma-separated for several) each read on it is logged with
+// its offset, which our own archive parser turns back into an entry name.
+REXCVAR_DEFINE_STRING(trace_file_reads, "", "Runtime",
+                      "Log every NtReadFile on files whose path contains one of these "
+                      "comma-separated substrings (e.g. PATCH3,DLC9), with offset and length")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(trace_file_opens, false, "Runtime",
                     "Log every file the title opens, not just the ones that fail. Turns the log "
                     "into a record of what the game went looking for, which is how you tell a "
@@ -220,6 +230,22 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
   }
 
   if (XSUCCEEDED(result)) {
+    const std::string& read_filter = REXCVAR_GET(trace_file_reads);
+    if (!read_filter.empty()) {
+      const std::string& path = file->path();
+      size_t at = 0;
+      while (at <= read_filter.size()) {
+        size_t comma = read_filter.find(',', at);
+        if (comma == std::string::npos) comma = read_filter.size();
+        std::string token = read_filter.substr(at, comma - at);
+        if (!token.empty() && path.find(token) != std::string::npos) {
+          REXKRNL_INFO("[NtReadFile] {} offset={:#x} len={:#x}", path,
+                       byte_offset_ptr ? byte_offset : file->position(), (uint32_t)buffer_length);
+          break;
+        }
+        at = comma + 1;
+      }
+    }
     if (true || file->is_synchronous()) {
       // Synchronous.
       uint32_t bytes_read = 0;
@@ -323,6 +349,25 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
   }
 
   if (XSUCCEEDED(result)) {
+    // Archives come through here, not NtReadFile - same trace_file_reads filter.
+    const std::string& read_filter = REXCVAR_GET(trace_file_reads);
+    if (!read_filter.empty()) {
+      const std::string& path = file->path();
+      size_t at = 0;
+      while (at <= read_filter.size()) {
+        size_t comma = read_filter.find(',', at);
+        if (comma == std::string::npos) comma = read_filter.size();
+        std::string token = read_filter.substr(at, comma - at);
+        if (!token.empty() && path.find(token) != std::string::npos) {
+          REXKRNL_INFO("[NtReadFileScatter] {} offset={:#x} len={:#x}", path,
+                       byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr)
+                                       : file->position(),
+                       (uint32_t)length);
+          break;
+        }
+        at = comma + 1;
+      }
+    }
     if (true || file->is_synchronous()) {
       // Synchronous.
       uint32_t bytes_read = 0;

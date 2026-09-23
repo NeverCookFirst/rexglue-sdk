@@ -19,7 +19,13 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 
+#include <csignal>
 #include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <string>
+
+#include <fmt/format.h>
 
 namespace rex::arch {
 
@@ -207,6 +213,59 @@ LONG WINAPI LastChanceExceptionFilter(PEXCEPTION_POINTERS ex_info) {
   }
   return EXCEPTION_CONTINUE_SEARCH;
 }
+
+// Installed at load time, not when the first handler is: one user's game
+// died 35 launches in a row between "UI font loaded" and "Guest memory arena
+// mapped" without a single line, because the filter used to go in together
+// with the MMIO handler - after the memory arena exists. Anything that dies
+// earlier left nothing behind. Install() re-applies it; that is harmless.
+// A process can also die without any SEH exception reaching the filter: an
+// uncaught C++ exception ends in std::terminate, abort() raises SIGABRT, and
+// the CRT's invalid-parameter and pure-call paths fast-fail. None of those
+// left a line either. Each gets a handler that says what it was and flushes,
+// then lets the default behaviour follow.
+void LogAndFlush(const char* what) {
+  REXLOG_CRITICAL("[FATAL] {}", what);
+  if (auto logger = ::rex::GetLogger()) {
+    logger->flush();
+  }
+}
+
+[[noreturn]] void OnTerminate() {
+  std::string reason = "std::terminate called";
+  if (auto current = std::current_exception()) {
+    try {
+      std::rethrow_exception(current);
+    } catch (const std::exception& e) {
+      reason = fmt::format("uncaught C++ exception: {}", e.what());
+    } catch (...) {
+      reason = "uncaught C++ exception of a non-std type";
+    }
+  }
+  LogAndFlush(reason.c_str());
+  if (crash_reporter_) {
+    RunCrashReporterGuarded();
+  }
+  std::abort();
+}
+
+void OnSigAbort(int) { LogAndFlush("abort() called"); }
+
+void OnInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int,
+                        uintptr_t) {
+  LogAndFlush("CRT invalid parameter");
+}
+
+void OnPureCall() { LogAndFlush("pure virtual call"); }
+
+const bool kLastChanceFilterInstalled = [] {
+  SetUnhandledExceptionFilter(LastChanceExceptionFilter);
+  std::set_terminate(OnTerminate);
+  std::signal(SIGABRT, OnSigAbort);
+  _set_invalid_parameter_handler(OnInvalidParameter);
+  _set_purecall_handler(OnPureCall);
+  return true;
+}();
 
 }  // namespace
 

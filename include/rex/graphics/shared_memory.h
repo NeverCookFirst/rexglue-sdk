@@ -10,7 +10,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -95,6 +97,12 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
+  // Diagnostics only: remember which pages memexport wrote, so CPU writes that
+  // later trip a watch on them show up as their own count in the slow-frame
+  // log. Question being answered: does the game's CPU touch memexported pages
+  // (then the readback is needed), or do the syncs serve nothing?
+  void NoteMemexportRange(uint32_t start, uint32_t length);
+
  protected:
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.
@@ -147,6 +155,10 @@ class SharedMemory {
   // on it is not hard - the access callback takes a range as an argument, and
   // touched pages of the buffer of this size will be invalidated).
   uint32_t page_size_log2_;
+
+  // One bit per 4 KB page of the 512 MB buffer, set by NoteMemexportRange.
+  // Atomic words: set on the GPU thread, tested on the faulting game thread.
+  std::unique_ptr<std::atomic<uint64_t>[]> memexport_pages_diag_;
 
   bool EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length);
   uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;

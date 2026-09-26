@@ -281,10 +281,14 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   void OnGotFocus(ui::UISetupEvent& e) override;
   void OnLostFocus(ui::UISetupEvent& e) override;
 
+ protected:
   // Suspends or resumes the guest's own threads and its audio. Withholding the vblank
   // is not enough on its own: the guest threads keep running and the audio keeps
-  // playing, which is what "paused" is meant to stop.
+  // playing, which is what "paused" is meant to stop. Protected so a game's own
+  // modal overlays (the main menu's quit prompt) can hold the game still too.
   void SetGuestPaused(bool paused);
+
+ private:
   void OnMinimized(ui::UIEvent& e) override;
   void OnRestored(ui::UIEvent& e) override;
 
@@ -314,6 +318,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::SettingsDialog> settings_overlay_;
   std::unique_ptr<ui::ImGuiDialog> achievements_overlay_;
   std::shared_ptr<ui::AchievementNotificationDialog> achievement_notification_;
+  std::unique_ptr<ui::ImGuiDialog> shader_compile_notice_;
   uint64_t achievement_notification_listener_ = 0;
   ui::DebugOverlayDialog::FrameStatsProvider frame_stats_provider_;
   std::filesystem::path config_path_;

@@ -22,6 +22,7 @@
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/logging.h>
+#include <rex/runtime.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/string.h>
@@ -447,6 +448,15 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
           // two cannot be joined, and the one question worth asking ("what is
           // the holder doing?") stays unanswerable. Name the owner properly.
           DescribeCriticalSectionOwner(uint32_t(cs->owning_thread));
+          // The owner is often a render thread waiting for the GPU, and the
+          // GPU in turn may be waiting on memory a blocked thread was to
+          // write. Say what the emulated GPU is stuck on, to close the loop.
+          if (auto* graphics = REX_KERNEL_STATE()->emulator()->graphics_system()) {
+            std::string gpu_state = graphics->DescribeState();
+            if (!gpu_state.empty()) {
+              REXKRNL_ERROR("STUCK-LOCK: GPU thread: {}", gpu_state);
+            }
+          }
         }
       }
     }

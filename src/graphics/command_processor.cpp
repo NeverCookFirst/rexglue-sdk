@@ -74,6 +74,17 @@ REXCVAR_DEFINE_BOOL(gpu_thread_fast_wait, true, "GPU",
                     "original 500-spin / 5 ms and full-interval sleeps.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// With vsync off (always, it is locked) a WAIT_REG_MEM that is not met used to
+// spin on MaybeYield for as long as it lasted - a whole host core, which on a
+// 4-core handheld (the Steam Deck report, 2026-09-24) is a quarter of the CPU.
+// Spin only for the first few hundred microseconds, where most waits end, then
+// sleep a millisecond per poll (a precise one - the default timer tick is 15.6).
+REXCVAR_DEFINE_INT32(gpu_wait_spin_us, 200, "GPU",
+                     "How long an unmet GPU wait spins before it starts sleeping 1 ms per "
+                     "poll. -1 = spin forever (the old behaviour).")
+    .range(-1, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
@@ -262,6 +273,7 @@ void CommandProcessor::WorkerThreadMain() {
       // burst to catch back-to-back submissions, then sleep on the event. The
       // 1 ms timeout (down from 5) bounds how long a CallInThread posted from
       // another thread can sit unnoticed, since those don't signal the event.
+      diag_opcode_.store(kDiagRingEmpty, std::memory_order_relaxed);
       PrepareForWait();
       const bool fast_wait = REXCVAR_GET(gpu_thread_fast_wait);
       uint32_t loop_count = 0;
@@ -807,6 +819,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     }
   }
 
+  diag_opcode_.store(opcode, std::memory_order_relaxed);
   bool result = false;
   switch (opcode) {
     case PM4_ME_INIT:
@@ -1102,6 +1115,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   }
 
   bool matched = false;
+  uint64_t wait_start_ticks = 0;
+  diag_wait_info_.store(wait_info, std::memory_order_relaxed);
+  diag_wait_addr_.store(poll_reg_addr, std::memory_order_relaxed);
+  diag_wait_ref_.store(ref, std::memory_order_relaxed);
+  diag_wait_start_ticks_.store(rex::chrono::Clock::QueryHostTickCount(),
+                               std::memory_order_relaxed);
   do {
     uint32_t value = 0;
     if (is_memory) {
@@ -1115,6 +1134,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         value = ReadRegisterValue(poll_reg_addr);
       }
     }
+    diag_wait_value_.store(value, std::memory_order_relaxed);
     switch (wait_info & 0x7) {
       case 0x0:  // Never.
         matched = false;
@@ -1146,8 +1166,19 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       if (wait >= 0x100) {
         PrepareForWait();
         if (!REXCVAR_GET(vsync)) {
-          // User wants it fast and dangerous.
-          rex::thread::MaybeYield();
+          // Fast, but not a whole core for as long as the wait lasts.
+          const int32_t spin_us = REXCVAR_GET(gpu_wait_spin_us);
+          const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+          if (!wait_start_ticks) {
+            wait_start_ticks = now;
+          }
+          if (spin_us >= 0 &&
+              (now - wait_start_ticks) * 1000000 / rex::chrono::Clock::QueryHostTickFrequency() >=
+                  uint64_t(spin_us)) {
+            rex::thread::SleepPrecise(std::chrono::milliseconds(1));
+          } else {
+            rex::thread::MaybeYield();
+          }
         } else {
           // Ported from TheSimpsonsGameRecomp's SDK fork: `wait` is the guest's
           // suggested poll interval, not a required duration (real hardware
@@ -1175,8 +1206,36 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+  diag_wait_start_ticks_.store(0, std::memory_order_relaxed);
 
   return true;
+}
+
+std::string CommandProcessor::DescribeState() const {
+  const uint32_t opcode = diag_opcode_.load(std::memory_order_relaxed);
+  std::string out;
+  if (opcode == kDiagRingEmpty) {
+    out = "ring empty, waiting for the guest to submit";
+  } else if (opcode == 0xFFFFFFFF) {
+    out = "has not run a packet yet";
+  } else {
+    out = fmt::format("executing PM4 opcode {:#04x}", opcode);
+  }
+  out += fmt::format(" | read ptr {:#x}, write ptr {:#x}", read_ptr_index_,
+                     write_ptr_index_.load(std::memory_order_relaxed));
+  const uint64_t wait_start = diag_wait_start_ticks_.load(std::memory_order_relaxed);
+  if (wait_start) {
+    const uint32_t info = diag_wait_info_.load(std::memory_order_relaxed);
+    static const char* kCompare[] = {"never", "<", "<=", "==", "!=", ">=", ">", "always"};
+    const uint64_t ms = (rex::chrono::Clock::QueryHostTickCount() - wait_start) * 1000 /
+                        rex::chrono::Clock::QueryHostTickFrequency();
+    out += fmt::format(
+        " | WAIT_REG_MEM for {} ms on {} {:#010x}: value {:#010x}, wants {} {:#010x}", ms,
+        (info & 0x10) ? "memory" : "register", diag_wait_addr_.load(std::memory_order_relaxed),
+        diag_wait_value_.load(std::memory_order_relaxed), kCompare[info & 7],
+        diag_wait_ref_.load(std::memory_order_relaxed));
+  }
+  return out;
 }
 
 bool CommandProcessor::ExecutePacketType3_REG_RMW(memory::RingBuffer* reader, uint32_t packet,

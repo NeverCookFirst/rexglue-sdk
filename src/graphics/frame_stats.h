@@ -28,6 +28,7 @@ enum Id : uint32_t {
   kReadbackResolve,    // resolve copied back to guest memory (count, bytes in extra)
   kMemoryInvalidate,   // CPU writes that tripped a GPU watch (count, bytes in extra)
   kMemexportFlush,     // host-GPU syncs to read memexport results back (bytes in extra)
+  kMemexportPageInvalidate,  // of kMemoryInvalidate, the ones on pages memexport wrote
   kCount
 };
 

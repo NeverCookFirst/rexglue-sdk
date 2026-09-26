@@ -300,6 +300,10 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         if (XXH3_64bits(&pipeline_stored_description.description,
                         sizeof(pipeline_stored_description.description)) !=
             pipeline_stored_description.description_hash) {
+          REXGPU_WARN(
+              "Pipeline storage: record {} of {} is corrupted, dropping it and "
+              "everything after it",
+              i, pipeline_storage_read_count);
           pipeline_stored_descriptions.resize(i);
           break;
         }
@@ -429,6 +433,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
           std::lock_guard<std::mutex> lock(shaders_translation_thread_mutex);
           --shader_translation_threads_busy;
         }
+        FinishCompileWork();
       }
       if (dxc_compiler) {
         dxc_compiler->Release();
@@ -485,6 +490,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       }
       // Request ucode information gathering and translation of all the needed
       // shaders.
+      AddCompileWork();
       {
         std::lock_guard<std::mutex> lock(shaders_translation_thread_mutex);
         shaders_to_translate.push_back(shader);
@@ -639,6 +645,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       COUNT_profile_set("gpu/pipeline_cache/pipelines", pipelines_.size());
       if (!creation_threads_.empty()) {
         // Submit the pipeline for creation to any available thread.
+        AddCompileWork();
         {
           std::lock_guard<std::mutex> lock(creation_request_lock_);
           creation_queue_.push(new_pipeline);
@@ -1031,6 +1038,7 @@ bool PipelineCache::ConfigurePipeline(
     new_pipeline->pending_vertex_shader = vertex_shader;
     new_pipeline->pending_pixel_shader = pixel_shader;
     // Submit the pipeline for creation to any available thread.
+    AddCompileWork();
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       creation_queue_.push(new_pipeline);
@@ -3106,7 +3114,12 @@ void PipelineCache::StorageWriteThread() {
         flush_pipelines = true;
       }
       if (!shader && !write_pipeline) {
-        storage_write_request_cond_.wait(lock);
+        // A flush picked up just now must happen before sleeping, not after
+        // the next request - otherwise the last batch sits in the stdio buffer
+        // and a hard exit loses it.
+        if (!flush_shaders && !flush_pipelines) {
+          storage_write_request_cond_.wait(lock);
+        }
         continue;
       }
     }
@@ -3245,6 +3258,7 @@ void PipelineCache::CreationThread(size_t thread_index) {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       --creation_threads_busy_;
     }
+    FinishCompileWork();
   }
 }
 
@@ -3263,11 +3277,37 @@ void PipelineCache::CreateQueuedPipelinesOnProcessorThread() {
     PipelineRuntimeDescription runtime_description;
     if (!PrepareRuntimeDescriptionForQueuedCreation(pipeline_to_create, runtime_description)) {
       pipeline_to_create->state.store(nullptr, std::memory_order_release);
+      FinishCompileWork();
       continue;
     }
     pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
                                     std::memory_order_release);
+    FinishCompileWork();
   }
+}
+
+void PipelineCache::AddCompileWork(uint32_t count) {
+  std::lock_guard<std::mutex> lock(compile_progress_mutex_);
+  compile_progress_total_ += count;
+}
+
+void PipelineCache::FinishCompileWork(uint32_t count) {
+  std::lock_guard<std::mutex> lock(compile_progress_mutex_);
+  compile_progress_done_ += count;
+  if (compile_progress_done_ >= compile_progress_total_) {
+    compile_progress_done_ = 0;
+    compile_progress_total_ = 0;
+  }
+}
+
+bool PipelineCache::GetCompileProgress(uint32_t& done, uint32_t& total) const {
+  std::lock_guard<std::mutex> lock(compile_progress_mutex_);
+  if (!compile_progress_total_) {
+    return false;
+  }
+  done = compile_progress_done_;
+  total = compile_progress_total_;
+  return true;
 }
 
 }  // namespace rex::graphics::d3d12

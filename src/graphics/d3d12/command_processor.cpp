@@ -262,12 +262,14 @@ void ReportSlowFrame() {
       "slow frame #{}: {:.1f} ms | gpu-thread idle {:.1f} | host-gpu wait {:.1f} ({}x) | "
       "shader translate {:.1f} ({}x) | pipeline create {:.1f} ({}x), new {} | "
       "texture load {:.1f} ({}x) | readback {}x {} KB, {} stalled | "
-      "cpu-write invalidations {}x {} KB | memexport syncs {} ({} KB)",
+      "cpu-write invalidations {}x {} KB (on memexport pages {}x {} KB) | "
+      "memexport syncs {} ({} KB)",
       frame_index, ms(frame_us), ms(s[kCpIdle].us), ms(s[kFenceWait].us), s[kFenceWait].count,
       ms(s[kShaderTranslate].us), s[kShaderTranslate].count, ms(s[kPipelineCreate].us),
       s[kPipelineCreate].count, s[kPipelineMiss].count, ms(s[kTextureLoad].us),
       s[kTextureLoad].count, s[kReadbackResolve].count, s[kReadbackResolve].extra / 1024,
       s[kReadbackResolve].us, s[kMemoryInvalidate].count, s[kMemoryInvalidate].extra / 1024,
+      s[kMemexportPageInvalidate].count, s[kMemexportPageInvalidate].extra / 1024,
       s[kMemexportFlush].count, s[kMemexportFlush].extra / 1024);
 }
 
@@ -2971,6 +2973,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
         shared_memory_->RangeWrittenByGpu(memexport_range.base_address_dwords << 2,
                                           memexport_range.size_bytes);
+        if (REXCVAR_GET(slow_frame_log_ms)) {
+          shared_memory_->NoteMemexportRange(memexport_range.base_address_dwords << 2,
+                                             memexport_range.size_bytes);
+        }
       }
     } else {
       // Stream constants can be invalid or dynamic, so exact destinations may

@@ -83,6 +83,9 @@ class GraphicsSystem : public system::IGraphicsSystem {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 
+  std::string DescribeState() const override;
+  bool GetCompileProgress(uint32_t& done, uint32_t& total) const override;
+
   bool is_paused() const { return paused_; }
   void Pause();
   void Resume();

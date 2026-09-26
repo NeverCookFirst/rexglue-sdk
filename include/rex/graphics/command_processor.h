@@ -87,6 +87,16 @@ class CommandProcessor {
   uint32_t counter() const { return counter_; }
   void increment_counter() { counter_++; }
 
+  // What the GPU thread is doing right now, for hang reports. Any thread.
+  std::string DescribeState() const;
+  // Background shader/pipeline compilation, for the on-screen notice. Any
+  // thread. Backends without a background compiler report idle.
+  virtual bool GetCompileProgress(uint32_t& done, uint32_t& total) const {
+    (void)done;
+    (void)total;
+    return false;
+  }
+
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
 
@@ -253,6 +263,15 @@ class CommandProcessor {
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;
+
+  // Read by DescribeState from other threads while the GPU thread runs.
+  static constexpr uint32_t kDiagRingEmpty = 0xFFFFFFFE;
+  std::atomic<uint32_t> diag_opcode_{0xFFFFFFFF};
+  std::atomic<uint32_t> diag_wait_addr_{0};
+  std::atomic<uint32_t> diag_wait_ref_{0};
+  std::atomic<uint32_t> diag_wait_value_{0};
+  std::atomic<uint32_t> diag_wait_info_{0};
+  std::atomic<uint64_t> diag_wait_start_ticks_{0};
 
   uint32_t read_ptr_index_ = 0;
   uint32_t read_ptr_update_freq_ = 0;

@@ -28,6 +28,7 @@ set(REXUI_OVERLAY_SOURCES
     overlay/achievement_toast.cpp
     overlay/achievements_overlay.cpp
     overlay/debug_overlay.cpp
+    overlay/shader_compile_notice.cpp
     overlay/console_overlay.cpp
     overlay/console_commands.cpp
     overlay/settings_overlay.cpp

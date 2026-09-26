@@ -66,6 +66,11 @@ class PipelineCache {
   void EndSubmission();
   bool IsCreatingPipelines();
 
+  // Background shader/pipeline work for the on-screen notice: done / total of
+  // the current burst. The counters reset once a burst is finished, so a new
+  // burst counts from zero instead of from everything ever compiled.
+  bool GetCompileProgress(uint32_t& done, uint32_t& total) const;
+
   D3D12Shader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                           uint32_t dword_count);
   // Analyze shader microcode on the translator thread.
@@ -407,6 +412,12 @@ class PipelineCache {
   // a pipeline is dequeued (the completion event can't be triggered before this
   // is zero). Protected with creation_request_lock_.
   size_t creation_threads_busy_ = 0;
+
+  mutable std::mutex compile_progress_mutex_;
+  uint32_t compile_progress_done_ = 0;
+  uint32_t compile_progress_total_ = 0;
+  void AddCompileWork(uint32_t count = 1);
+  void FinishCompileWork(uint32_t count = 1);
   // Manual-reset event set when the last queued pipeline is created and there
   // are no more pipelines to create. This is triggered by the thread creating
   // the last pipeline.

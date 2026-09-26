@@ -28,6 +28,7 @@
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
+#include <rex/ui/overlay/shader_compile_notice.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
@@ -59,7 +60,7 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
 REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
                       "Graphics backend the GPU plugin should construct: 'any' (plugin's own "
                       "preference), 'd3d12' or 'vulkan'")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex {
 
@@ -525,6 +526,15 @@ void ReXApp::LaunchModule() {
           });
     }
 
+    if (!shader_compile_notice_ && imgui_drawer_ && runtime_) {
+      auto* runtime = runtime_.get();
+      shader_compile_notice_ = std::make_unique<ui::ShaderCompileNoticeDialog>(
+          imgui_drawer_.get(), [runtime](uint32_t& done, uint32_t& total) {
+            auto* graphics = runtime->graphics_system();
+            return graphics && graphics->GetCompileProgress(done, total);
+          });
+    }
+
     OnPreLaunchModule();
 
     auto main_thread = runtime_->PrepareModuleLaunch();
@@ -689,6 +699,7 @@ void ReXApp::OnDestroy() {
     achievement_notification_listener_ = 0;
   }
   achievement_notification_.reset();
+  shader_compile_notice_.reset();
   achievements_overlay_.reset();
   settings_overlay_.reset();
   console_overlay_.reset();

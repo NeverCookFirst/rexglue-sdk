@@ -113,6 +113,10 @@ void SyncMemory();
 
 // Sleeps the current thread for at least as long as the given duration.
 void Sleep(std::chrono::microseconds duration);
+// Sleeps close to the requested time even below the 15.6 ms default timer
+// tick (a high-resolution waitable timer on Windows). Sleep() above rounds
+// sub-millisecond requests down to a yield and whole ones up to the tick.
+void SleepPrecise(std::chrono::microseconds duration);
 template <typename Rep, typename Period>
 void Sleep(std::chrono::duration<Rep, Period> duration) {
   Sleep(std::chrono::duration_cast<std::chrono::microseconds>(duration));

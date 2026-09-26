@@ -3670,7 +3670,10 @@ void VulkanPipelineCache::StorageWriteThread() {
         flush_pipelines = true;
       }
       if (!shader && !write_pipeline) {
-        storage_write_request_cond_.wait(lock);
+        // See the D3D12 writer: flush before sleeping, not after the next request.
+        if (!flush_shaders && !flush_pipelines) {
+          storage_write_request_cond_.wait(lock);
+        }
         continue;
       }
     }

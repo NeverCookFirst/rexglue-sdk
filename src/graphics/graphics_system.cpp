@@ -349,6 +349,14 @@ void GraphicsSystem::MarkVblank() {
   DispatchInterruptCallback(0, 2);
 }
 
+std::string GraphicsSystem::DescribeState() const {
+  return command_processor_ ? command_processor_->DescribeState() : std::string();
+}
+
+bool GraphicsSystem::GetCompileProgress(uint32_t& done, uint32_t& total) const {
+  return command_processor_ && command_processor_->GetCompileProgress(done, total);
+}
+
 void GraphicsSystem::ClearCaches() {
   command_processor_->CallInThread([&]() { command_processor_->ClearCaches(); });
 }

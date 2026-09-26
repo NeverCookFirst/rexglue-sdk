@@ -101,6 +101,24 @@ void Sleep(std::chrono::microseconds duration) {
   }
 }
 
+void SleepPrecise(std::chrono::microseconds duration) {
+  // One timer per thread, created on first use. The flag needs Windows 10
+  // 1803; older systems (and a failed create) fall back to the plain Sleep.
+  thread_local HANDLE timer = CreateWaitableTimerExW(
+      nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  if (!timer) {
+    Sleep(duration);
+    return;
+  }
+  LARGE_INTEGER due;
+  due.QuadPart = -int64_t(duration.count()) * 10;  // Relative, 100 ns units.
+  if (!SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+    Sleep(duration);
+    return;
+  }
+  WaitForSingleObject(timer, INFINITE);
+}
+
 SleepResult AlertableSleep(std::chrono::microseconds duration) {
   if (SleepEx(static_cast<DWORD>(duration.count() / 1000), TRUE) == WAIT_IO_COMPLETION) {
     return SleepResult::kAlerted;

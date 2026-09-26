@@ -146,10 +146,14 @@ bool TruncateStdioFile(FILE* file, uint64_t length) {
   if (rex_ftruncate64(fileno(file), rex_off64_t(length))) {
     return false;
   }
-  if (uint64_t(position) > length) {
-    if (!Seek(file, 0, SEEK_END)) {
-      return false;
-    }
+  // Always reposition, even when the position is already at the new end. A
+  // stream that was last read without hitting EOF may only switch to writing
+  // after a seek (C11 7.21.5.3). The Windows CRT lets it slide; Wine's msvcrt
+  // (Proton, the Steam Deck) sets the error flag instead, and every later
+  // fwrite is dropped - the pipeline cache never grew past its first session.
+  (void)position;
+  if (!Seek(file, 0, SEEK_END)) {
+    return false;
   }
   return true;
 }

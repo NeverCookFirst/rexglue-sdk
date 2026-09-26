@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string>
 
 #include <rex/system/xtypes.h>
 
@@ -92,6 +93,18 @@ class IGraphicsSystem {
   }
 
   virtual void Shutdown() = 0;
+
+  // One line on what the GPU thread is doing right now, for hang reports
+  // (STUCK-LOCK). Empty when there is nothing to say.
+  virtual std::string DescribeState() const { return {}; }
+
+  // Shaders and pipelines being compiled in the background: how many of the
+  // current burst are done, out of how many. false when idle.
+  virtual bool GetCompileProgress(uint32_t& done, uint32_t& total) const {
+    (void)done;
+    (void)total;
+    return false;
+  }
 };
 
 }  // namespace rex::system

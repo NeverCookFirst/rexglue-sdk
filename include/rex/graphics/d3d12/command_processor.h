@@ -53,6 +53,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   void ClearCaches() override;
   void InvalidateGpuMemory() override;
 
+  bool GetCompileProgress(uint32_t& done, uint32_t& total) const override {
+    return pipeline_cache_ && pipeline_cache_->GetCompileProgress(done, total);
+  }
+
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 

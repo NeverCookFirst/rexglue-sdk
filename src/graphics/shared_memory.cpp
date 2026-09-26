@@ -25,6 +25,9 @@ namespace rex::graphics {
 
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
   page_size_log2_ = rex::log2_ceil(uint32_t(rex::memory::page_size()));
+  // Allocated up front: it is read from game threads without a lock.
+  memexport_pages_diag_ =
+      std::make_unique<std::atomic<uint64_t>[]>((kBufferSize >> 12) / 64);
 }
 
 SharedMemory::~SharedMemory() {
@@ -257,6 +260,17 @@ void SharedMemory::FireWatchesLocked(const std::unique_lock<std::recursive_mutex
         UnlinkWatchRange(range);
       }
     }
+  }
+}
+
+void SharedMemory::NoteMemexportRange(uint32_t start, uint32_t length) {
+  if (length == 0 || start >= kBufferSize) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  for (uint32_t page = start >> 12, last = (start + length - 1) >> 12; page <= last; ++page) {
+    memexport_pages_diag_[page >> 6].fetch_or(uint64_t(1) << (page & 63),
+                                              std::memory_order_relaxed);
   }
 }
 
@@ -493,6 +507,18 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   length = std::min(length, kBufferSize - physical_address_start);
   // Runs on the game thread that faulted writing GPU-watched memory.
   frame_stats::Add(frame_stats::kMemoryInvalidate, 0, length);
+  if (auto* pages = memexport_pages_diag_.get()) {
+    uint32_t hit_bytes = 0;
+    const uint32_t last = physical_address_start + length - 1;
+    for (uint32_t page = physical_address_start >> 12; page <= (last >> 12); ++page) {
+      if (pages[page >> 6].load(std::memory_order_relaxed) & (uint64_t(1) << (page & 63))) {
+        hit_bytes += 4096;
+      }
+    }
+    if (hit_bytes) {
+      frame_stats::Add(frame_stats::kMemexportPageInvalidate, 0, hit_bytes);
+    }
+  }
   uint32_t physical_address_last = physical_address_start + (length - 1);
 
   uint32_t page_first = physical_address_start >> page_size_log2_;

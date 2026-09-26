@@ -206,6 +206,8 @@ void Sleep(std::chrono::microseconds duration) {
   } while (ret == -1 && errno == EINTR);
 }
 
+void SleepPrecise(std::chrono::microseconds duration) { Sleep(duration); }
+
 // TODO(bwrsandman) Implement by allowing alert interrupts from IO operations
 thread_local bool alertable_state_ = false;
 bool DispatchCurrentThreadUserCallback();

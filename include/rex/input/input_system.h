@@ -49,6 +49,15 @@ class InputSystem : public system::IInputSystem {
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
 
+  /// For host-side modal prompts. While blocked the guest reads an idle pad
+  /// and no keystrokes, but its own polling keeps running, and the buttons it
+  /// would have seen are published through HeldButtons(). That is the only
+  /// safe way for another thread to read the pad: this class has no locking,
+  /// and every GetState rebuilds the device list under whoever is iterating it.
+  static void SetGuestInputBlocked(bool blocked);
+  /// X_INPUT_GAMEPAD_* bits held on any user, as of the guest's latest poll.
+  static uint16_t HeldButtons();
+
   /// Raw non-controller HID device (the emulated LEGO Dimensions ToyPad),
   /// reached from XamInputNonControllerGetRaw/SetRaw. Null when absent.
   Portal* GetPortal() const { return portal_.get(); }

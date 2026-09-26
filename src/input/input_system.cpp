@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
 
 #include <rex/dbg.h>
@@ -229,6 +231,21 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
   return driver->GetDeviceCapabilities(chosen, flags, out_caps);
 }
 
+namespace {
+std::atomic<bool> g_guest_input_blocked{false};
+std::array<std::atomic<uint16_t>, 4> g_held_buttons{};
+}  // namespace
+
+void InputSystem::SetGuestInputBlocked(bool blocked) { g_guest_input_blocked.store(blocked); }
+
+uint16_t InputSystem::HeldButtons() {
+  uint16_t buttons = 0;
+  for (const auto& held : g_held_buttons) {
+    buttons |= held.load(std::memory_order_relaxed);
+  }
+  return buttons;
+}
+
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
   if (!assignment_) {
@@ -259,8 +276,19 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     }
   }
 
+  if (user_index < g_held_buttons.size()) {
+    g_held_buttons[user_index].store(any ? uint16_t(merged.gamepad.buttons) : 0,
+                                     std::memory_order_relaxed);
+  }
   if (!any) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  if (g_guest_input_blocked.load(std::memory_order_relaxed)) {
+    // Connected but idle; the packet number still moves so nothing thinks the
+    // pad was unplugged.
+    const uint32_t packet = merged.packet_number;
+    merged = {};
+    merged.packet_number = packet;
   }
   if (out_state) {
     *out_state = merged;
@@ -314,6 +342,9 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
   SCOPE_profile_cpu_f("hid");
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  if (g_guest_input_blocked.load(std::memory_order_relaxed)) {
+    return X_ERROR_EMPTY;
   }
 
   RefreshDevices();

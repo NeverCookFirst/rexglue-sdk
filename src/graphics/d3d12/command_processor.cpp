@@ -63,7 +63,7 @@ REXCVAR_DEFINE_UINT32(readback_resolve_max_kb, 0, "GPU/D3D12",
                       "The resolve itself still happens; only the copy to the CPU is "
                       "skipped.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(readback_memexport_batched, true, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(readback_memexport_batched, false, "GPU/D3D12",
                     "With memexport readback on and the fast path off, queue each draw's "
                     "readback and sync with the GPU once, when the guest can observe the "
                     "results, instead of after every draw");
@@ -1180,6 +1180,8 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize shared memory");
     return false;
   }
+  memexport_cpu_write_watch_ =
+      shared_memory_->RegisterGlobalWatch(MemexportCpuWriteWatchThunk, this);
 
   // Initialize the render target cache before configuring binding - need to
   // know if using rasterizer-ordered views for the bindless root signature.
@@ -1989,6 +1991,10 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   render_target_cache_.reset();
 
+  if (memexport_cpu_write_watch_) {
+    shared_memory_->UnregisterGlobalWatch(memexport_cpu_write_watch_);
+    memexport_cpu_write_watch_ = nullptr;
+  }
   shared_memory_.reset();
 
   deferred_command_list_.Reset();
@@ -3042,7 +3048,30 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackBatched(uint32_t total_si
                                          memexport_range.size_bytes);
     memexport_batch_used_ += memexport_range.size_bytes;
   }
+  memexport_batch_queued_.store(uint32_t(memexport_batch_ranges_.size()),
+                                std::memory_order_release);
   return true;
+}
+
+namespace {
+// Set while the flush itself copies into guest memory: that write faults on
+// the same watched pages, and it is not the game's.
+thread_local bool memexport_flush_writing = false;
+}  // namespace
+
+void D3D12CommandProcessor::MemexportCpuWriteWatchThunk(
+    const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+    uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu) {
+  auto* self = static_cast<D3D12CommandProcessor*>(context);
+  if (invalidated_by_gpu || memexport_flush_writing) {
+    return;
+  }
+  uint32_t queued = self->memexport_batch_queued_.load(std::memory_order_acquire);
+  if (!queued) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(self->memexport_cpu_writes_mutex_);
+  self->memexport_cpu_writes_.push_back({address_first, address_last, queued});
 }
 
 void D3D12CommandProcessor::FlushMemexportReadbackBatch(const char* why) {
@@ -3064,6 +3093,14 @@ void D3D12CommandProcessor::FlushMemexportReadbackBatch(const char* why) {
     }
   }
   frame_stats::Add(frame_stats::kMemexportFlush, 0, memexport_batch_used_);
+  // Stop recording before the wait: a write from here on lands after the
+  // copies below, so it wins without help.
+  memexport_batch_queued_.store(0, std::memory_order_release);
+  std::vector<MemexportCpuWrite> cpu_writes;
+  {
+    std::lock_guard<std::mutex> lock(memexport_cpu_writes_mutex_);
+    cpu_writes.swap(memexport_cpu_writes_);
+  }
   if (AwaitAllQueueOperationsCompletion()) {
     D3D12_RANGE read_range = {0, memexport_batch_used_};
     void* mapping = nullptr;
@@ -3071,10 +3108,36 @@ void D3D12CommandProcessor::FlushMemexportReadbackBatch(const char* why) {
       // In queue order, so a later draw's export of the same range wins, as it
       // did when each draw was synced on its own.
       const uint8_t* bytes = static_cast<const uint8_t*>(mapping);
-      for (const auto& [address, size] : memexport_batch_ranges_) {
-        std::memcpy(memory_->TranslatePhysical(address), bytes, size);
+      memexport_flush_writing = true;
+      for (uint32_t i = 0; i < uint32_t(memexport_batch_ranges_.size()); ++i) {
+        const auto [address, size] = memexport_batch_ranges_[i];
+        // Copy only what the game has not written since this range was queued.
+        uint32_t cursor = address;
+        const uint32_t end = address + size;
+        while (cursor < end) {
+          uint32_t chunk_end = end;
+          uint32_t skip_to = cursor;
+          for (const MemexportCpuWrite& w : cpu_writes) {
+            if (i >= w.queued_ranges || w.address_last < cursor || w.address_first >= chunk_end) {
+              continue;
+            }
+            if (w.address_first <= cursor) {
+              skip_to = std::max(skip_to, std::min(end, w.address_last + 1));
+            } else {
+              chunk_end = w.address_first;
+            }
+          }
+          if (skip_to > cursor) {
+            cursor = skip_to;
+            continue;
+          }
+          std::memcpy(memory_->TranslatePhysical(cursor), bytes + (cursor - address),
+                      chunk_end - cursor);
+          cursor = chunk_end;
+        }
         bytes += size;
       }
+      memexport_flush_writing = false;
       D3D12_RANGE write_range = {};
       memexport_batch_buffer_->Unmap(0, &write_range);
     }

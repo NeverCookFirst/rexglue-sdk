@@ -16,6 +16,7 @@
 #include <atomic>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -662,6 +663,23 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t memexport_batch_used_ = 0;
   // Guest physical address and size of each queued range, in buffer order.
   std::vector<std::pair<uint32_t, uint32_t>> memexport_batch_ranges_;
+  // CPU writes to GPU-watched memory while a batch is queued. Each is stamped
+  // with how many ranges were queued at the time; the flush must not overwrite
+  // those bytes in an earlier-queued range, or it puts stale GPU data back over
+  // what the game wrote since (exploded geometry on Endless Sea of
+  // Possibilities). The full path synced before the game could write.
+  struct MemexportCpuWrite {
+    uint32_t address_first;
+    uint32_t address_last;
+    uint32_t queued_ranges;
+  };
+  std::mutex memexport_cpu_writes_mutex_;
+  std::vector<MemexportCpuWrite> memexport_cpu_writes_;
+  std::atomic<uint32_t> memexport_batch_queued_{0};
+  SharedMemory::GlobalWatchHandle memexport_cpu_write_watch_ = nullptr;
+  static void MemexportCpuWriteWatchThunk(const std::unique_lock<std::recursive_mutex>& global_lock,
+                                          void* context, uint32_t address_first,
+                                          uint32_t address_last, bool invalidated_by_gpu);
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 

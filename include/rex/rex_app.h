@@ -282,6 +282,12 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   void OnLostFocus(ui::UISetupEvent& e) override;
 
  protected:
+  // Whether any of the SDK's own overlays (debug, console, settings,
+  // achievements) is open, e.g. to decide if the mouse cursor is needed.
+  bool AnyOverlayOpen() const {
+    return debug_overlay_ || console_overlay_ || settings_overlay_ || achievements_overlay_;
+  }
+
   // Suspends or resumes the guest's own threads and its audio. Withholding the vblank
   // is not enough on its own: the guest threads keep running and the audio keeps
   // playing, which is what "paused" is meant to stop. Protected so a game's own

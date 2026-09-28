@@ -67,6 +67,12 @@ REXCVAR_DEFINE_BOOL(readback_memexport_batched, false, "GPU/D3D12",
                     "With memexport readback on and the fast path off, queue each draw's "
                     "readback and sync with the GPU once, when the guest can observe the "
                     "results, instead of after every draw");
+REXCVAR_DEFINE_BOOL(readback_memexport_on_demand, true, "GPU/D3D12",
+                    "With memexport readback on, don't wait for the GPU after each exporting "
+                    "draw: protect the exported pages and read the data back only when the "
+                    "GPU has finished it or the game touches it first. Off = the old "
+                    "synchronous path (a full CPU/GPU sync per exporting draw)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_UINT32(slow_frame_log_ms, 0, "GPU/D3D12",
                       "Log a breakdown of every frame slower than this many milliseconds "
                       "(0 = off): GPU-thread idle, host GPU waits, shader/pipeline work, "
@@ -263,14 +269,15 @@ void ReportSlowFrame() {
       "shader translate {:.1f} ({}x) | pipeline create {:.1f} ({}x), new {} | "
       "texture load {:.1f} ({}x) | readback {}x {} KB, {} stalled | "
       "cpu-write invalidations {}x {} KB (on memexport pages {}x {} KB) | "
-      "memexport syncs {} ({} KB)",
+      "memexport syncs {} ({} KB), on demand {} ({} KB)",
       frame_index, ms(frame_us), ms(s[kCpIdle].us), ms(s[kFenceWait].us), s[kFenceWait].count,
       ms(s[kShaderTranslate].us), s[kShaderTranslate].count, ms(s[kPipelineCreate].us),
       s[kPipelineCreate].count, s[kPipelineMiss].count, ms(s[kTextureLoad].us),
       s[kTextureLoad].count, s[kReadbackResolve].count, s[kReadbackResolve].extra / 1024,
       s[kReadbackResolve].us, s[kMemoryInvalidate].count, s[kMemoryInvalidate].extra / 1024,
       s[kMemexportPageInvalidate].count, s[kMemexportPageInvalidate].extra / 1024,
-      s[kMemexportFlush].count, s[kMemexportFlush].extra / 1024);
+      s[kMemexportFlush].count, s[kMemexportFlush].extra / 1024, s[kMemexportOnDemand].count,
+      s[kMemexportOnDemand].extra / 1024);
 }
 
 uint64_t ParseHashArg(std::string_view args) {
@@ -1125,6 +1132,11 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to create the submission fence");
     return false;
   }
+  on_demand_fence_event_ = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+  if (on_demand_fence_event_) {
+    memory_->SetPhysicalMemoryDataProvider(ProvideOnDemandMemexportThunk, this);
+    on_demand_provider_set_ = true;
+  }
   if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
                                  IID_PPV_ARGS(&queue_operations_since_submission_fence_)))) {
     REXGPU_ERROR(
@@ -1880,6 +1892,21 @@ bool D3D12CommandProcessor::SetupContext() {
 
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  if (on_demand_provider_set_) {
+    PublishOnDemandMemexport();
+    RetireOnDemandMemexport(true);
+    memory_->SetPhysicalMemoryDataProvider(nullptr, nullptr);
+    on_demand_provider_set_ = false;
+  }
+  for (OnDemandReadbackBuffer& free_buffer : on_demand_free_) {
+    free_buffer.buffer->Unmap(0, nullptr);
+    free_buffer.buffer->Release();
+  }
+  on_demand_free_.clear();
+  if (on_demand_fence_event_) {
+    CloseHandle(on_demand_fence_event_);
+    on_demand_fence_event_ = nullptr;
+  }
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -2996,7 +3023,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         memexport_total_size += memexport_range.size_bytes;
       }
       if (memexport_total_size != 0) {
-        if (REXCVAR_GET(readback_memexport_fast)) {
+        if (REXCVAR_GET(readback_memexport_on_demand) && on_demand_provider_set_) {
+          IssueDraw_MemexportReadbackOnDemand(memexport_total_size);
+        } else if (REXCVAR_GET(readback_memexport_fast)) {
           IssueDraw_MemexportReadbackFastPath(memexport_total_size);
         } else if (REXCVAR_GET(readback_memexport_batched)) {
           IssueDraw_MemexportReadbackBatched(memexport_total_size);
@@ -3007,6 +3036,268 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  return true;
+}
+
+bool D3D12CommandProcessor::IssueDraw_MemexportReadbackOnDemand(uint32_t total_size) {
+  if (!total_size || memexport_ranges_.empty()) {
+    return true;
+  }
+
+  // Exports queue up in one buffer until published. Start a new batch if the
+  // current one is published already or full.
+  bool need_batch = true;
+  {
+    std::lock_guard<std::mutex> lock(on_demand_mutex_);
+    if (!on_demand_pending_.empty()) {
+      const OnDemandReadback& back = on_demand_pending_.back();
+      need_batch = back.published || back.used + total_size > back.buffer.size;
+    }
+  }
+  if (need_batch) {
+    if (on_demand_unpublished_) {
+      // The unpublished batch is full: publish it, it can't grow any more.
+      PublishOnDemandMemexport();
+    }
+    constexpr uint32_t kBatchMinSize = 4u << 20;
+    OnDemandReadbackBuffer buffer;
+    {
+      std::lock_guard<std::mutex> lock(on_demand_mutex_);
+      for (size_t i = 0; i < on_demand_free_.size(); ++i) {
+        if (on_demand_free_[i].size >= total_size) {
+          buffer = on_demand_free_[i];
+          on_demand_free_[i] = on_demand_free_.back();
+          on_demand_free_.pop_back();
+          break;
+        }
+      }
+    }
+    if (!buffer.buffer) {
+      uint32_t size = AlignReadbackBufferSize(std::max(total_size, kBatchMinSize));
+      const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+      D3D12_RESOURCE_DESC buffer_desc;
+      ui::d3d12::util::FillBufferResourceDesc(buffer_desc, size, D3D12_RESOURCE_FLAG_NONE);
+      ID3D12Resource* resource = nullptr;
+      void* mapping = nullptr;
+      D3D12_RANGE read_range = {0, size};
+      if (FAILED(provider.GetDevice()->CreateCommittedResource(
+              &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
+              &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&resource))) ||
+          FAILED(resource->Map(0, &read_range, &mapping))) {
+        if (resource) {
+          resource->Release();
+        }
+        REXGPU_ERROR("Failed to create a {} KB on-demand memexport readback buffer", size >> 10);
+        return IssueDraw_MemexportReadbackFullPath(total_size);
+      }
+      buffer.buffer = resource;
+      buffer.mapping = static_cast<const uint8_t*>(mapping);
+      buffer.size = size;
+    }
+    OnDemandReadback batch;
+    batch.buffer = buffer;
+    batch.first_seq = on_demand_seq_.load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(on_demand_mutex_);
+    on_demand_pending_.push_back(std::move(batch));
+  }
+
+  shared_memory_->UseAsCopySource();
+  SubmitBarriers();
+  ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
+  // Only this thread changes the unpublished batch; the lock is for readers
+  // walking the queue (the retire's page coverage check).
+  std::lock_guard<std::mutex> lock(on_demand_mutex_);
+  OnDemandReadback& batch = on_demand_pending_.back();
+  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    uint32_t address = memexport_range.base_address_dwords << 2;
+    deferred_command_list_.D3DCopyBufferRegion(batch.buffer.buffer, batch.used,
+                                               shared_memory_buffer, address,
+                                               memexport_range.size_bytes);
+    batch.ranges.emplace_back(address, memexport_range.size_bytes);
+    batch.used += memexport_range.size_bytes;
+    on_demand_seq_.fetch_add(1, std::memory_order_release);
+  }
+  batch.submission = submission_current_;
+  on_demand_unpublished_ = true;
+  on_demand_recording_.store(true, std::memory_order_release);
+  frame_stats::Add(frame_stats::kMemexportOnDemand, 0, total_size);
+  return true;
+}
+
+void D3D12CommandProcessor::PublishOnDemandMemexport() {
+  if (!on_demand_unpublished_) {
+    return;
+  }
+  // So a thread waiting for this data only ever waits for the GPU itself.
+  if (submission_open_) {
+    EndSubmission(false);
+  }
+  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+  std::lock_guard<std::mutex> lock(on_demand_mutex_);
+  // Protect first, as one call per run of pages, and only then stop recording
+  // CPU writes - a write in between would otherwise be lost.
+  std::vector<std::pair<uint32_t, uint32_t>> pages;  // [first, last]
+  for (OnDemandReadback& batch : on_demand_pending_) {
+    if (batch.published) {
+      continue;
+    }
+    for (const auto& [address, size] : batch.ranges) {
+      pages.emplace_back(address >> 12, (address + size - 1) >> 12);
+    }
+  }
+  std::sort(pages.begin(), pages.end());
+  for (size_t i = 0; i < pages.size();) {
+    uint32_t first = pages[i].first, last = pages[i].second;
+    for (++i; i < pages.size() && pages[i].first <= last + 1; ++i) {
+      last = std::max(last, pages[i].second);
+    }
+    memory_->EnablePhysicalMemoryDataProviders(first << 12, (last - first + 1) << 12);
+  }
+  std::vector<OnDemandCpuWrite> cpu_writes;
+  {
+    std::lock_guard<std::mutex> writes_lock(memexport_cpu_writes_mutex_);
+    on_demand_recording_.store(false, std::memory_order_release);
+    cpu_writes.swap(on_demand_cpu_writes_);
+  }
+  for (OnDemandReadback& batch : on_demand_pending_) {
+    if (!batch.published) {
+      batch.published = true;
+      batch.cpu_writes = cpu_writes;
+    }
+  }
+  on_demand_unpublished_ = false;
+}
+
+void D3D12CommandProcessor::RetireOnDemandMemexport(bool wait) {
+  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+  std::lock_guard<std::mutex> lock(on_demand_mutex_);
+  if (on_demand_pending_.empty() || !on_demand_pending_.front().published) {
+    return;
+  }
+  uint64_t completed = submission_fence_->GetCompletedValue();
+  if (wait) {
+    // Everything published is submitted, so this never waits on a thread.
+    uint64_t await_submission = 0;
+    for (const OnDemandReadback& batch : on_demand_pending_) {
+      if (batch.published) {
+        await_submission = batch.submission;
+      }
+    }
+    if (completed < await_submission) {
+      frame_stats::Scope fence_scope(frame_stats::kFenceWait);
+      if (SUCCEEDED(submission_fence_->SetEventOnCompletion(await_submission,
+                                                            on_demand_fence_event_))) {
+        WaitForSingleObject(on_demand_fence_event_, INFINITE);
+      }
+      completed = submission_fence_->GetCompletedValue();
+      frame_stats::Add(frame_stats::kMemexportFlush, 0, 0);
+    }
+  }
+  // In queue order, so a later export of the same bytes wins. Bytes the game
+  // wrote after an export was queued (but before it was published) are kept.
+  std::vector<std::pair<uint32_t, uint32_t>> retired;  // pages [first, last]
+  while (!on_demand_pending_.empty() && on_demand_pending_.front().published &&
+         on_demand_pending_.front().submission <= completed) {
+    OnDemandReadback& batch = on_demand_pending_.front();
+    const uint8_t* source = batch.buffer.mapping;
+    for (size_t i = 0; i < batch.ranges.size(); ++i) {
+      const auto [address, size] = batch.ranges[i];
+      const uint64_t seq = batch.first_seq + i;
+      uint32_t cursor = address;
+      const uint32_t end = address + size;
+      while (cursor < end) {
+        uint32_t chunk_end = end;
+        uint32_t skip_to = cursor;
+        for (const OnDemandCpuWrite& w : batch.cpu_writes) {
+          if (w.seq <= seq || w.address_last < cursor || w.address_first >= chunk_end) {
+            continue;
+          }
+          if (w.address_first <= cursor) {
+            skip_to = std::max(skip_to, std::min(end, w.address_last + 1));
+          } else {
+            chunk_end = w.address_first;
+          }
+        }
+        if (skip_to > cursor) {
+          cursor = skip_to;
+          continue;
+        }
+        std::memcpy(memory_->TranslatePhysical(cursor), source + (cursor - address),
+                    chunk_end - cursor);
+        cursor = chunk_end;
+      }
+      source += size;
+      retired.emplace_back(address >> 12, (address + size - 1) >> 12);
+    }
+    OnDemandReadbackBuffer buffer = batch.buffer;
+    on_demand_pending_.pop_front();
+    on_demand_free_.push_back(buffer);
+  }
+  if (retired.empty()) {
+    return;
+  }
+  // Reopen the retired pages, as runs, except those a later published batch
+  // still covers (an unpublished batch's pages were never protected).
+  std::vector<std::pair<uint32_t, uint32_t>> still;
+  for (const OnDemandReadback& batch : on_demand_pending_) {
+    if (!batch.published) {
+      continue;
+    }
+    for (const auto& [address, size] : batch.ranges) {
+      still.emplace_back(address >> 12, (address + size - 1) >> 12);
+    }
+  }
+  std::sort(retired.begin(), retired.end());
+  auto covered = [&still](uint32_t page) {
+    for (const auto& [first, last] : still) {
+      if (page >= first && page <= last) {
+        return true;
+      }
+    }
+    return false;
+  };
+  for (size_t i = 0; i < retired.size();) {
+    uint32_t first = retired[i].first, last = retired[i].second;
+    for (++i; i < retired.size() && retired[i].first <= last + 1; ++i) {
+      last = std::max(last, retired[i].second);
+    }
+    if (still.empty()) {
+      memory_->DisablePhysicalMemoryDataProviders(first << 12, (last - first + 1) << 12);
+      continue;
+    }
+    uint32_t run_first = UINT32_MAX;
+    for (uint32_t page = first; page <= last + 1; ++page) {
+      bool open = page <= last && !covered(page);
+      if (open && run_first == UINT32_MAX) {
+        run_first = page;
+      } else if (!open && run_first != UINT32_MAX) {
+        memory_->DisablePhysicalMemoryDataProviders(run_first << 12, (page - run_first) << 12);
+        run_first = UINT32_MAX;
+      }
+    }
+  }
+  // Bound the free list: keep at most 64 MB of idle buffers.
+  uint64_t free_bytes = 0;
+  for (size_t i = 0; i < on_demand_free_.size();) {
+    free_bytes += on_demand_free_[i].size;
+    if (free_bytes > (64u << 20)) {
+      on_demand_free_[i].buffer->Unmap(0, nullptr);
+      on_demand_free_[i].buffer->Release();
+      on_demand_free_[i] = on_demand_free_.back();
+      on_demand_free_.pop_back();
+      continue;
+    }
+    ++i;
+  }
+}
+
+bool D3D12CommandProcessor::ProvideOnDemandMemexportThunk(
+    std::unique_lock<std::recursive_mutex>& global_lock_locked_once, void* context,
+    uint32_t physical_address) {
+  auto* self = static_cast<D3D12CommandProcessor*>(context);
+  self->RetireOnDemandMemexport(true);
+  // Whatever was still marked on this page has been delivered now.
+  self->memory_->DisablePhysicalMemoryDataProviders(physical_address & ~uint32_t(0xFFF), 0x1000);
   return true;
 }
 
@@ -3065,6 +3356,11 @@ void D3D12CommandProcessor::MemexportCpuWriteWatchThunk(
   auto* self = static_cast<D3D12CommandProcessor*>(context);
   if (invalidated_by_gpu || memexport_flush_writing) {
     return;
+  }
+  if (self->on_demand_recording_.load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> lock(self->memexport_cpu_writes_mutex_);
+    self->on_demand_cpu_writes_.push_back(
+        {address_first, address_last, self->on_demand_seq_.load(std::memory_order_acquire)});
   }
   uint32_t queued = self->memexport_batch_queued_.load(std::memory_order_acquire);
   if (!queued) {
@@ -3148,6 +3444,8 @@ void D3D12CommandProcessor::FlushMemexportReadbackBatch(const char* why) {
 
 void D3D12CommandProcessor::OnGuestMemoryPoll(uint32_t physical_address) {
   physical_address &= 0x1FFFFFFF;
+  PublishOnDemandMemexport();
+  memory_->ProvidePhysicalMemory(physical_address, 4);
   for (const auto& [address, size] : memexport_batch_ranges_) {
     if (physical_address - (address & 0x1FFFFFFF) < size) {
       FlushMemexportReadbackBatch("WAIT_REG_MEM on exported memory");
@@ -3157,12 +3455,14 @@ void D3D12CommandProcessor::OnGuestMemoryPoll(uint32_t physical_address) {
 }
 
 void D3D12CommandProcessor::OnGuestVisibleWrite(const char* why) {
+  PublishOnDemandMemexport();
   FlushMemexportReadbackBatch(why);
 }
 
 void D3D12CommandProcessor::PrepareForWait() {
   // Out of commands (or about to spin on guest memory): nothing later in the
   // ring can land the queue, and the guest may be waiting on the results.
+  PublishOnDemandMemexport();
   FlushMemexportReadbackBatch("idle/wait");
   CommandProcessor::PrepareForWait();
 }
@@ -3550,6 +3850,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       rb.mapped_data[read_index]) {
     uint8_t* destination = memory_->TranslatePhysical(written_address);
     if (destination) {
+      // Older memexport data still pending there must land first, not after.
+      memory_->ProvidePhysicalMemory(written_address, written_length);
       std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
     }
   }
@@ -3824,6 +4126,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     }
     EvictOldReadbackBuffers(readback_buffers_);
     EvictOldReadbackBuffers(memexport_readback_buffers_);
+    RetireOnDemandMemexport(false);
 
     primitive_processor_->BeginFrame();
 

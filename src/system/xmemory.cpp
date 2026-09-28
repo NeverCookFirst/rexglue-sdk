@@ -562,6 +562,19 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
   // Will be rounded to physical page boundaries internally, so just pass 1 as
   // the length - guranteed not to cross page boundaries also.
   auto physical_heap = static_cast<PhysicalHeap*>(heap);
+  // The page's current data is still on the GPU - have it delivered first. The
+  // retried access may then hit the write watch, which is handled normally.
+  if (physical_memory_data_provider_ && physical_heap->IsDataProvided(virtual_address)) {
+    uint32_t physical_address = physical_heap->GetPhysicalAddress(virtual_address);
+    if (physical_memory_data_provider_(global_lock_locked_once,
+                                       physical_memory_data_provider_context_,
+                                       physical_address)) {
+      return true;
+    }
+    // Never leave the guest faulting forever on a page nobody will provide.
+    DisablePhysicalMemoryDataProviders(physical_address & ~uint32_t(0xFFF), 0x1000);
+    return true;
+  }
   if (physical_heap->TriggerCallbacks(std::move(global_lock_locked_once), virtual_address, 1,
                                       is_write, false)) {
     return true;
@@ -694,6 +707,44 @@ void Memory::EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint
                                          enable_invalidation_notifications, enable_data_providers);
   heaps_.vE0000000.EnableAccessCallbacks(physical_address, length,
                                          enable_invalidation_notifications, enable_data_providers);
+}
+
+void Memory::SetPhysicalMemoryDataProvider(PhysicalMemoryDataProvider provider, void* context) {
+  auto global_lock = global_critical_region_.Acquire();
+  physical_memory_data_provider_ = provider;
+  physical_memory_data_provider_context_ = context;
+}
+
+void Memory::EnablePhysicalMemoryDataProviders(uint32_t physical_address, uint32_t length) {
+  heaps_.vA0000000.EnableDataProviders(physical_address, length);
+  heaps_.vC0000000.EnableDataProviders(physical_address, length);
+  heaps_.vE0000000.EnableDataProviders(physical_address, length);
+}
+
+void Memory::DisablePhysicalMemoryDataProviders(uint32_t physical_address, uint32_t length) {
+  heaps_.vA0000000.DisableDataProviders(physical_address, length);
+  heaps_.vC0000000.DisableDataProviders(physical_address, length);
+  heaps_.vE0000000.DisableDataProviders(physical_address, length);
+}
+
+void Memory::ProvidePhysicalMemory(uint32_t physical_address, uint32_t length) const {
+  if (!physical_memory_data_provider_ || !length) {
+    return;
+  }
+  // Providers are enabled on all three physical views alike - vA0000000 maps
+  // physical memory one to one.
+  uint32_t page_first = physical_address >> 12;
+  uint32_t page_last = (physical_address + length - 1) >> 12;
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    if (heaps_.vA0000000.IsDataProvided(0xA0000000 + (page << 12))) {
+      auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+      if (physical_memory_data_provider_) {
+        physical_memory_data_provider_(global_lock, physical_memory_data_provider_context_,
+                                       page << 12);
+      }
+      return;
+    }
+  }
 }
 
 uint32_t Memory::SystemHeapAlloc(uint32_t size, uint32_t alignment, uint32_t system_heap_flags) {
@@ -991,6 +1042,14 @@ bool BaseHeap::SyncHostPageAccess(uint32_t start_page_number, uint32_t end_page_
     // is safe; restoring write access loses invalidations, which is not.
     if (access == rex::memory::PageAccess::kReadWrite && IsHostPageWriteWatched(host_page_number)) {
       access = rex::memory::PageAccess::kReadOnly;
+    }
+    // Same for a page whose data is still on the GPU: it must keep faulting.
+    // (heaps_.physical is a VirtualHeap of the same type, hence the identity check.)
+    if (access != rex::memory::PageAccess::kNoAccess &&
+        (this == &memory_->heaps_.vA0000000 || this == &memory_->heaps_.vC0000000 ||
+         this == &memory_->heaps_.vE0000000) &&
+        static_cast<const PhysicalHeap*>(this)->IsHostPageDataProvided(host_page_number)) {
+      access = rex::memory::PageAccess::kNoAccess;
     }
     return access;
   };
@@ -2154,7 +2213,8 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
           // TODO(Triang3l): Check if data providers are already enabled.
           // If data providers are already enabled for the page, it has even
           // stricter protection.
-          protect_system_page = true;
+          // A page waiting for GPU data is already inaccessible - keep it so.
+          protect_system_page = (page_flags_block.provide_data & page_flags_bit) == 0;
           page_flags_block.notify_on_invalidation |= page_flags_bit;
         }
       }
@@ -2291,7 +2351,8 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
     for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
       // Check if need to allow writing to this page.
       bool unprotect_page =
-          (system_page_flags_[i >> 6].notify_on_invalidation & (uint64_t(1) << (i & 63))) != 0;
+          (system_page_flags_[i >> 6].notify_on_invalidation & (uint64_t(1) << (i & 63))) != 0 &&
+          (system_page_flags_[i >> 6].provide_data & (uint64_t(1) << (i & 63))) == 0;
       if (unprotect_page) {
         uint32_t guest_page_number =
             rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
@@ -2351,6 +2412,101 @@ bool PhysicalHeap::IsHostPageWriteWatched(uint32_t host_page_number) const {
   }
   return (system_page_flags_[host_page_number >> 6].notify_on_invalidation &
           (uint64_t(1) << (host_page_number & 63))) != 0;
+}
+
+bool PhysicalHeap::IsHostPageDataProvided(uint32_t host_page_number) const {
+  if (host_page_number >= system_page_count_) {
+    return false;
+  }
+  return (system_page_flags_[host_page_number >> 6].provide_data &
+          (uint64_t(1) << (host_page_number & 63))) != 0;
+}
+
+bool PhysicalHeap::IsDataProvided(uint32_t virtual_address) const {
+  if (virtual_address < heap_base_ || virtual_address - heap_base_ >= heap_size_) {
+    return false;
+  }
+  return IsHostPageDataProvided((virtual_address - heap_base_ + host_address_offset()) /
+                                system_page_size_);
+}
+
+void PhysicalHeap::EnableDataProviders(uint32_t physical_address, uint32_t length) {
+  SetDataProviders(physical_address, length, true);
+}
+
+void PhysicalHeap::DisableDataProviders(uint32_t physical_address, uint32_t length) {
+  SetDataProviders(physical_address, length, false);
+}
+
+void PhysicalHeap::SetDataProviders(uint32_t physical_address, uint32_t length, bool enable) {
+  uint32_t physical_address_offset = GetPhysicalAddress(heap_base_);
+  if (physical_address < physical_address_offset) {
+    if (physical_address_offset - physical_address >= length) {
+      return;
+    }
+    length -= physical_address_offset - physical_address;
+    physical_address = physical_address_offset;
+  }
+  uint32_t heap_relative_address = physical_address - physical_address_offset;
+  if (length == 0 || heap_relative_address >= heap_size_) {
+    return;
+  }
+  length = std::min(length, heap_size_ - heap_relative_address);
+  uint32_t system_page_first = (heap_relative_address + host_address_offset()) / system_page_size_;
+  uint32_t system_page_last = std::min(
+      (heap_relative_address + length - 1 + host_address_offset()) / system_page_size_,
+      system_page_count_ - 1);
+
+  uint8_t* protect_base = membase_ + heap_base_;
+  auto global_lock = global_critical_region_.Acquire();
+  // Consecutive pages getting the same protection go in one call.
+  uint32_t run_first = UINT32_MAX;
+  rex::memory::PageAccess run_access = rex::memory::PageAccess::kNoAccess;
+  auto flush_run = [&](uint32_t run_end) {
+    if (run_first != UINT32_MAX) {
+      rex::memory::Protect(protect_base + run_first * system_page_size_,
+                           (run_end - run_first) * system_page_size_, run_access, nullptr);
+      run_first = UINT32_MAX;
+    }
+  };
+  for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
+    SystemPageFlagsBlock& page_flags_block = system_page_flags_[i >> 6];
+    uint64_t page_flags_bit = uint64_t(1) << (i & 63);
+    uint32_t guest_page_number =
+        rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
+    bool change = false;
+    rex::memory::PageAccess access = rex::memory::PageAccess::kNoAccess;
+    if (guest_page_number < page_table_.size()) {
+      rex::memory::PageAccess guest_access =
+          ToPageAccess(page_table_[guest_page_number].current_protect);
+      if (enable) {
+        // Inaccessible pages need real access violations. Read-only ones may
+        // still be read, so they are covered too.
+        if (guest_access != rex::memory::PageAccess::kNoAccess &&
+            !(page_flags_block.provide_data & page_flags_bit)) {
+          page_flags_block.provide_data |= page_flags_bit;
+          change = true;
+        }
+      } else if (page_flags_block.provide_data & page_flags_bit) {
+        page_flags_block.provide_data &= ~page_flags_bit;
+        // Back to what the guest and the write watch want.
+        access = guest_access;
+        if (access == rex::memory::PageAccess::kReadWrite &&
+            (page_flags_block.notify_on_invalidation & page_flags_bit)) {
+          access = rex::memory::PageAccess::kReadOnly;
+        }
+        change = true;
+      }
+    }
+    if (!change || (run_first != UINT32_MAX && access != run_access)) {
+      flush_run(i);
+    }
+    if (change && run_first == UINT32_MAX) {
+      run_first = i;
+      run_access = access;
+    }
+  }
+  flush_run(system_page_last + 1);
 }
 
 uint32_t PhysicalHeap::GetPhysicalAddress(uint32_t address) const {

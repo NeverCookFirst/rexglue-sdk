@@ -644,6 +644,9 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
       if (cache_transaction.GetFoundResult()) {
         cacheable = *cache_transaction.GetFoundResult();
       } else {
+        memory_.ProvidePhysicalMemory(
+            guest_index_base,
+            guest_draw_vertex_count * (guest_index_format == xenos::IndexFormat::kInt16 ? 2 : 4));
         const void* guest_indices_ptr = memory_.TranslatePhysical(guest_index_base);
         cacheable.index_buffer_type = ProcessedIndexBufferType::kHostConverted;
         cacheable.host_primitive_reset_enabled = false;

@@ -457,6 +457,12 @@ class D3D12TextureCache final : public TextureCache {
   D3D12CommandProcessor& command_processor_;
   bool bindless_resources_used_;
 
+  // Bits per guest format: whether the host format can be sampled with
+  // filtering. Linear filtering of a format without it is undefined behavior
+  // (Nvidia tolerates it, AMD may return zeros).
+  uint64_t host_filterable_unsigned_ = 0;
+  uint64_t host_filterable_signed_ = 0;
+
   Microsoft::WRL::ComPtr<ID3D12RootSignature> load_root_signature_;
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_;
   // Load pipelines for resolution-scaled resolve targets.

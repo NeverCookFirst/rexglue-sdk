@@ -406,6 +406,28 @@ bool D3D12TextureCache::Initialize() {
   }
   scaled_resolve_heap_count_ = 0;
 
+  // GetSamplerParameters drops filtering for non-filterable formats (upstream
+  // xenia-canary 197929d9, matches Vulkan).
+  for (uint32_t i = 0; i < uint32_t(std::size(host_formats_)); ++i) {
+    const HostFormat& host_format = host_formats_[i];
+    uint64_t format_bit = uint64_t(1) << i;
+    auto filterable = [device](DXGI_FORMAT format) {
+      if (format == DXGI_FORMAT_UNKNOWN) {
+        return false;
+      }
+      D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support = {format};
+      return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &format_support,
+                                                   sizeof(format_support))) &&
+             (format_support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE);
+    };
+    if (filterable(host_format.dxgi_format_unsigned)) {
+      host_filterable_unsigned_ |= format_bit;
+    }
+    if (filterable(host_format.dxgi_format_signed)) {
+      host_filterable_signed_ |= format_bit;
+    }
+  }
+
   // Create the loading root signature.
   D3D12_ROOT_PARAMETER root_parameters[3];
   // Parameter 0 is constants (changed multiple times when untiling).
@@ -988,6 +1010,26 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
     parameters.mip_linear = mip_filter == xenos::TextureFilter::kLinear;
   }
   parameters.mip_base_map = mip_base_map;
+
+  // Fall back to point sampling if the host format doesn't report
+  // D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE.
+  if (parameters.mag_linear || parameters.min_linear || parameters.mip_linear ||
+      parameters.aniso_filter != xenos::AnisoFilter::kDisabled) {
+    TextureKey texture_key;
+    uint8_t texture_swizzled_signs;
+    BindingInfoFromFetchConstant(fetch, texture_key, &texture_swizzled_signs);
+    uint64_t format_bit = texture_key.is_valid ? uint64_t(1) << uint32_t(texture_key.format) : 0;
+    if (!texture_key.is_valid ||
+        (texture_util::IsAnySignNotSigned(texture_swizzled_signs) &&
+         (host_filterable_unsigned_ & format_bit) == 0) ||
+        (texture_util::IsAnySignSigned(texture_swizzled_signs) &&
+         (host_filterable_signed_ & format_bit) == 0)) {
+      parameters.mag_linear = 0;
+      parameters.min_linear = 0;
+      parameters.mip_linear = 0;
+      parameters.aniso_filter = xenos::AnisoFilter::kDisabled;
+    }
+  }
 
   return parameters;
 }

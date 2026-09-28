@@ -128,6 +128,10 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
       assert_true(vgt_draw_initiator.index_size == xenos::IndexFormat::kInt32);
       index_buffer_base &= ~uint32_t(sizeof(uint32_t) - 1);
     }
+    memory_.ProvidePhysicalMemory(
+        index_buffer_base,
+        vgt_draw_initiator.num_indices *
+            (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16 ? 2 : 4));
     index_buffer = memory_.TranslatePhysical(index_buffer_base);
   }
   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();

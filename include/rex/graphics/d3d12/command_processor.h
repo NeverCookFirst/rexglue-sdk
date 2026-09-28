@@ -221,6 +221,19 @@ class D3D12CommandProcessor : public CommandProcessor {
   void FlushMemexportReadbackBatch(const char* why);
   void PrepareForWait() override;
 
+  // On-demand memexport readback: the copy is submitted without waiting, the
+  // pages are made inaccessible to the guest, and the data is written back only
+  // when the GPU has finished it (retired without waiting) or when the guest
+  // touches a page first (waits for the GPU then).
+  bool IssueDraw_MemexportReadbackOnDemand(uint32_t total_size);
+  // Writes back pending readbacks in order: all of them if `wait`, awaiting the
+  // GPU, or else only the prefix the GPU has already completed. Takes the global
+  // critical region (recursive, so a fault handler already holding it is fine).
+  void RetireOnDemandMemexport(bool wait);
+  static bool ProvideOnDemandMemexportThunk(
+      std::unique_lock<std::recursive_mutex>& global_lock_locked_once, void* context,
+      uint32_t physical_address);
+
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
 
@@ -658,6 +671,49 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   ID3D12Resource* readback_buffer_ = nullptr;
   uint32_t readback_buffer_size_ = 0;
+  struct OnDemandReadbackBuffer {
+    ID3D12Resource* buffer = nullptr;
+    const uint8_t* mapping = nullptr;
+    uint32_t size = 0;
+  };
+  // A CPU write to GPU-watched memory while exports were queued but not yet
+  // published; `seq` is how many ranges had been queued by then.
+  struct OnDemandCpuWrite {
+    uint32_t address_first;
+    uint32_t address_last;
+    uint64_t seq;
+  };
+  struct OnDemandReadback {
+    OnDemandReadbackBuffer buffer;
+    // Signaled by submission_fence_ once the copy is done.
+    uint64_t submission = 0;
+    // Guest physical address and size of each range, in buffer order. Range i
+    // was queued as number first_seq + i.
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
+    uint64_t first_seq = 0;
+    uint32_t used = 0;
+    // Submitted and its pages protected. Until then it is invisible to the
+    // guest, and the retire copy must keep what the game wrote meanwhile.
+    bool published = false;
+    std::vector<OnDemandCpuWrite> cpu_writes;
+  };
+  // Submits the queued exports and protects their pages, all at once. Called
+  // where the guest can learn the GPU progressed (fences, events, interrupts)
+  // and before idling - the guest can't rely on the data any earlier.
+  void PublishOnDemandMemexport();
+  std::atomic<uint64_t> on_demand_seq_{0};
+  std::atomic<bool> on_demand_recording_{false};
+  std::vector<OnDemandCpuWrite> on_demand_cpu_writes_;  // memexport_cpu_writes_mutex_
+  bool on_demand_unpublished_ = false;
+  // Lock order: the global critical region, then this. The fence may be waited
+  // on while both are held - every pending copy is already submitted, so its
+  // completion does not depend on any thread.
+  std::mutex on_demand_mutex_;
+  std::deque<OnDemandReadback> on_demand_pending_;
+  std::vector<OnDemandReadbackBuffer> on_demand_free_;
+  HANDLE on_demand_fence_event_ = nullptr;
+  bool on_demand_provider_set_ = false;
+
   ID3D12Resource* memexport_batch_buffer_ = nullptr;
   uint32_t memexport_batch_capacity_ = 0;
   uint32_t memexport_batch_used_ = 0;

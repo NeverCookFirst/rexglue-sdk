@@ -67,7 +67,7 @@ REXCVAR_DEFINE_BOOL(readback_memexport_batched, false, "GPU/D3D12",
                     "With memexport readback on and the fast path off, queue each draw's "
                     "readback and sync with the GPU once, when the guest can observe the "
                     "results, instead of after every draw");
-REXCVAR_DEFINE_BOOL(readback_memexport_on_demand, true, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(readback_memexport_on_demand, false, "GPU/D3D12",
                     "With memexport readback on, don't wait for the GPU after each exporting "
                     "draw: protect the exported pages and read the data back only when the "
                     "GPU has finished it or the game touches it first. Off = the old "

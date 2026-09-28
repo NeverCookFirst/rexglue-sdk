@@ -34,7 +34,7 @@ REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
 // kHotReload (default): Window::SetFullscreen can be applied live, so the
 // change callback registered in ReXApp::SetupPresentation keeps the window
 // in sync whenever this cvar is changed at runtime.
-REXCVAR_DEFINE_BOOL(fullscreen, true, "UI/Window", "Start the window in fullscreen mode");
+REXCVAR_DEFINE_BOOL(fullscreen, false, "UI/Window", "Start the window in fullscreen mode");
 
 // The size the fullscreen toggle drops the window to. Separate from window_width /
 // window_height, which are the startup size and cannot change once the window is up.

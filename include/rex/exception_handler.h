@@ -538,6 +538,11 @@ class ExceptionHandler {
   // invoked on the hot path; a crash is the only trigger.
   typedef void (*CrashReporter)();
   static void SetCrashReporter(CrashReporter fn);
+
+  // Writes a small minidump of the live process (every thread's stack) to
+  // <prefix>-<pid>.dmp without a crash - for freezes, where the last-chance
+  // filter never runs. Returns false if nothing was written.
+  static bool WriteDump(const char* prefix);
 };
 
 }  // namespace rex::arch

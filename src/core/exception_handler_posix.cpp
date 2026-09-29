@@ -419,6 +419,8 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
   }
 }
 
+bool ExceptionHandler::WriteDump(const char*) { return false; }
+
 void ExceptionHandler::SetCrashReporter(CrashReporter) {
   // No last-chance filter on this platform yet; nothing to attach it to.
 }

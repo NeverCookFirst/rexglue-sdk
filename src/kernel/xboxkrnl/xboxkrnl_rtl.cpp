@@ -389,6 +389,7 @@ u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECT
 namespace {
 // Defined below, next to the other reporting helper.
 void DescribeCriticalSectionOwner(uint32_t owner_object);
+std::string GuestBacktrace(uint32_t stack_pointer);
 }  // namespace
 
 void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
@@ -448,6 +449,15 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
           // two cannot be joined, and the one question worth asking ("what is
           // the holder doing?") stays unanswerable. Name the owner properly.
           DescribeCriticalSectionOwner(uint32_t(cs->owning_thread));
+          // The other half of an ABBA loop: what the waiter already holds
+          // shows in who called it here.
+          if (auto* self = XThread::GetCurrentThread()) {
+            auto* self_state = self->thread_state();
+            if (auto* self_ctx = self_state ? self_state->context() : nullptr) {
+              REXKRNL_ERROR("STUCK-LOCK: waiter's callers: lr={:08X} <- {}",
+                            uint32_t(self_ctx->lr), GuestBacktrace(uint32_t(self_ctx->r1.u32)));
+            }
+          }
           // The owner is often a render thread waiting for the GPU, and the
           // GPU in turn may be waiting on memory a blocked thread was to
           // write. Say what the emulated GPU is stuck on, to close the loop.
@@ -456,6 +466,12 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
             if (!gpu_state.empty()) {
               REXKRNL_ERROR("STUCK-LOCK: GPU thread: {}", gpu_state);
             }
+          }
+          // A freeze never reaches the crash filter, so players had nothing
+          // to attach. One dump per session, of the first stuck lock.
+          static std::atomic<bool> hang_dumped{false};
+          if (!hang_dumped.exchange(true)) {
+            rex::arch::ExceptionHandler::WriteDump("hang");
           }
         }
       }

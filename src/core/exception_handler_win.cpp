@@ -132,6 +132,68 @@ bool RunCrashReporterGuarded() {
   }
 }
 
+// dbghelp is loaded on demand so the runtime keeps no link-time dependency on
+// it; if it is missing, the log lines are still written.
+bool WriteDumpImpl(PEXCEPTION_POINTERS ex_info, const char* prefix) {
+  using PFNMiniDumpWriteDump = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int,
+                                             void*, void*, void*);
+  HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
+  if (!dbghelp) {
+    return false;
+  }
+  auto write_dump = reinterpret_cast<PFNMiniDumpWriteDump>(
+      GetProcAddress(dbghelp, "MiniDumpWriteDump"));
+  if (!write_dump) {
+    return false;
+  }
+  char path[MAX_PATH];
+  _snprintf_s(path, MAX_PATH, _TRUNCATE, "%s-%lu.dmp", prefix,
+              GetCurrentProcessId());
+  HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    REXLOG_CRITICAL("[FATAL] Could not create {} (error 0x{:08X})", path,
+                    static_cast<uint32_t>(GetLastError()));
+    return false;
+  }
+  struct {
+    DWORD thread_id;
+    PEXCEPTION_POINTERS exception_pointers;
+    BOOL client_pointers;
+  } dump_info = {GetCurrentThreadId(), ex_info, FALSE};
+  void* info = ex_info ? &dump_info : nullptr;
+  // MiniDumpWithFullMemory failed on every machine and left a 0-byte file:
+  // the guest arena is several GB mapped through more than one view. Stacks,
+  // thread info, data segments and the memory the stacks point at keep the
+  // dump to a few MB that users can actually attach.
+  // 0x1 DataSegs | 0x4 HandleData | 0x40 IndirectlyReferencedMemory
+  // | 0x800 FullMemoryInfo | 0x1000 ThreadInfo.
+  const DWORD kDumpType = 0x1 | 0x4 | 0x40 | 0x800 | 0x1000;
+  BOOL ok = write_dump(GetCurrentProcess(), GetCurrentProcessId(), file,
+                       kDumpType, info, nullptr, nullptr);
+  const DWORD err = ok ? 0 : GetLastError();
+  if (!ok) {
+    // Fall back to the smallest dump that still has every stack.
+    SetFilePointer(file, 0, nullptr, FILE_BEGIN);
+    SetEndOfFile(file);
+    ok = write_dump(GetCurrentProcess(), GetCurrentProcessId(), file,
+                    0 /* MiniDumpNormal */, info, nullptr, nullptr);
+  }
+  const DWORD err2 = ok ? 0 : GetLastError();
+  CloseHandle(file);
+  if (ok) {
+    REXLOG_CRITICAL("[FATAL] Minidump written to {}", path);
+  } else {
+    DeleteFileA(path);
+    REXLOG_CRITICAL("[FATAL] Minidump failed (error 0x{:08X}, fallback 0x{:08X})",
+                    static_cast<uint32_t>(err), static_cast<uint32_t>(err2));
+  }
+  if (auto logger = ::rex::GetLogger()) {
+    logger->flush();
+  }
+  return ok != FALSE;
+}
+
 LONG WINAPI LastChanceExceptionFilter(PEXCEPTION_POINTERS ex_info) {
   const EXCEPTION_RECORD* record = ex_info->ExceptionRecord;
   const uint64_t address = reinterpret_cast<uint64_t>(record->ExceptionAddress);
@@ -179,38 +241,7 @@ LONG WINAPI LastChanceExceptionFilter(PEXCEPTION_POINTERS ex_info) {
     }
   }
 
-  // dbghelp is loaded on demand so the runtime keeps no link-time dependency
-  // on it; if it is missing, the log lines above are still written.
-  using PFNMiniDumpWriteDump = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int,
-                                             void*, void*, void*);
-  if (HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll")) {
-    auto write_dump = reinterpret_cast<PFNMiniDumpWriteDump>(
-        GetProcAddress(dbghelp, "MiniDumpWriteDump"));
-    if (write_dump) {
-      wchar_t path[MAX_PATH];
-      _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"crash-%lu.dmp",
-                   GetCurrentProcessId());
-      HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                                FILE_ATTRIBUTE_NORMAL, nullptr);
-      if (file != INVALID_HANDLE_VALUE) {
-        struct {
-          DWORD thread_id;
-          PEXCEPTION_POINTERS exception_pointers;
-          BOOL client_pointers;
-        } dump_info = {GetCurrentThreadId(), ex_info, FALSE};
-        // 2 = MiniDumpWithFullMemory: large, but a stack alone rarely explains
-        // a crash in recompiled code.
-        write_dump(GetCurrentProcess(), GetCurrentProcessId(), file, 2,
-                   &dump_info, nullptr, nullptr);
-        CloseHandle(file);
-        REXLOG_CRITICAL("[FATAL] Minidump written to crash-{}.dmp",
-                        static_cast<uint32_t>(GetCurrentProcessId()));
-        if (auto logger = ::rex::GetLogger()) {
-          logger->flush();
-        }
-      }
-    }
-  }
+  WriteDumpImpl(ex_info, "crash");
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -292,6 +323,10 @@ void ExceptionHandler::Install(Handler fn, void* data) {
 }
 
 void ExceptionHandler::SetCrashReporter(CrashReporter fn) { crash_reporter_ = fn; }
+
+bool ExceptionHandler::WriteDump(const char* prefix) {
+  return WriteDumpImpl(nullptr, prefix);
+}
 
 void ExceptionHandler::Uninstall(Handler fn, void* data) {
   for (size_t i = 0; i < rex::countof(handlers_); ++i) {

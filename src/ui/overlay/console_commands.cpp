@@ -11,6 +11,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 #include <rex/cvar.h>
+#include <rex/exception_handler.h>
 #include <rex/logging.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/kernel_state.h>
@@ -32,6 +33,14 @@
 #include <vector>
 
 namespace {
+
+// For a freeze that never trips STUCK-LOCK: the player opens the console and
+// asks for a dump by hand.
+void ConsoleDump(std::string_view) {
+  if (!rex::arch::ExceptionHandler::WriteDump("dump")) {
+    REXLOG_INFO("dump: could not write a minidump");
+  }
+}
 
 void ConsoleEcho(std::string_view args) {
   REXLOG_INFO("{}", args);
@@ -1140,6 +1149,9 @@ REXCVAR_DEFINE_COMMAND_ARGS(findword, ConsoleFindWord, "Console",
 
 REXCVAR_DEFINE_COMMAND_ARGS(call, ConsoleCall, "Console",
                             "Call a guest function: call <hex address> [hex arg]...");
+
+REXCVAR_DEFINE_COMMAND_ARGS(dump, ConsoleDump, "Console",
+                            "Write a minidump of the running game to dump-<pid>.dmp");
 
 REXCVAR_DEFINE_COMMAND_ARGS(echo, ConsoleEcho, "Console", "Echo arguments to the console");
 REXCVAR_DEFINE_COMMAND_ARGS(find, ConsoleFind, "Console",

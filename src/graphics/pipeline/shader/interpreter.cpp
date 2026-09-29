@@ -20,6 +20,8 @@
 #include <rex/math.h>
 #include <rex/types.h>
 
+#include "../../memexport_trace.h"
+
 namespace rex::graphics {
 
 void ShaderInterpreter::Execute() {
@@ -951,8 +953,11 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(ucode::VertexFetchInstruct
     uint32_t data[4] = {};
     const uint32_t* memory_dwords = reinterpret_cast<const uint32_t*>(memory_.physical_membase());
     // Exported by an earlier draw and still only on the GPU? Get it first.
-    memory_.ProvidePhysicalMemory(
-        uint32_t(int32_t(state_.vfetch_address_dwords) + instr.offset()) << 2, 4 * 4);
+    const uint32_t fetch_address =
+        uint32_t(int32_t(state_.vfetch_address_dwords) + instr.offset()) << 2;
+    memexport_trace::RecordHostRead(memexport_trace::HostReadSource::kCpuVertexFetch,
+                                    fetch_address, 4 * 4);
+    memory_.ProvidePhysicalMemory(fetch_address, 4 * 4);
     uint32_t buffer_end_dwords = fetch_constant.address + fetch_constant.size;
     uint32_t dword_0_address_dwords =
         uint32_t(int32_t(state_.vfetch_address_dwords) + instr.offset());

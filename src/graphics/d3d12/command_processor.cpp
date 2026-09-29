@@ -41,6 +41,8 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+#include "../memexport_trace.h"
+
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -2185,6 +2187,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     FrameStats().Report();
   }
   FlushMemexportReadbackBatch("swap");
+  memexport_trace::EndFrame();
   ReportSlowFrame();
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
@@ -2853,6 +2856,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       return false;
     }
   }
+  if (memexport_used && memexport_trace::IsActive()) {
+    uint32_t memexport_total_size = 0;
+    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+      const uint32_t address = memexport_range.base_address_dwords << 2;
+      memexport_total_size += memexport_range.size_bytes;
+      memexport_trace::RecordRange(address, memexport_range.size_bytes);
+    }
+    memexport_trace::RecordDraw(
+        vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+        memexport_used_vertex, memexport_used_pixel,
+        primitive_processing_result.host_draw_vertex_count, uint32_t(memexport_ranges_.size()),
+        memexport_total_size);
+  }
 
   // Primitive topology.
   D3D_PRIMITIVE_TOPOLOGY primitive_topology;
@@ -3128,6 +3144,7 @@ void D3D12CommandProcessor::PublishOnDemandMemexport() {
   if (!on_demand_unpublished_) {
     return;
   }
+  memexport_trace::RecordPublish("publish on demand");
   // So a thread waiting for this data only ever waits for the GPU itself.
   if (submission_open_) {
     EndSubmission(false);
@@ -3295,6 +3312,8 @@ bool D3D12CommandProcessor::ProvideOnDemandMemexportThunk(
     std::unique_lock<std::recursive_mutex>& global_lock_locked_once, void* context,
     uint32_t physical_address) {
   auto* self = static_cast<D3D12CommandProcessor*>(context);
+  memexport_trace::RecordHostRead(memexport_trace::HostReadSource::kDataProvider,
+                                  physical_address, 0x1000);
   self->RetireOnDemandMemexport(true);
   // Whatever was still marked on this page has been delivered now.
   self->memory_->DisablePhysicalMemoryDataProviders(physical_address & ~uint32_t(0xFFF), 0x1000);
@@ -3357,6 +3376,7 @@ void D3D12CommandProcessor::MemexportCpuWriteWatchThunk(
   if (invalidated_by_gpu || memexport_flush_writing) {
     return;
   }
+  memexport_trace::RecordCpuWrite(address_first, address_last);
   if (self->on_demand_recording_.load(std::memory_order_acquire)) {
     std::lock_guard<std::mutex> lock(self->memexport_cpu_writes_mutex_);
     self->on_demand_cpu_writes_.push_back(
@@ -3374,6 +3394,7 @@ void D3D12CommandProcessor::FlushMemexportReadbackBatch(const char* why) {
   if (memexport_batch_ranges_.empty()) {
     return;
   }
+  memexport_trace::RecordPublish(why);
   if (REXCVAR_GET(slow_frame_log_ms)) {
     // Which packets force the syncs: summed and logged every 5 s.
     static std::map<std::string, uint64_t> reasons;
@@ -3444,6 +3465,8 @@ void D3D12CommandProcessor::FlushMemexportReadbackBatch(const char* why) {
 
 void D3D12CommandProcessor::OnGuestMemoryPoll(uint32_t physical_address) {
   physical_address &= 0x1FFFFFFF;
+  memexport_trace::RecordHostRead(memexport_trace::HostReadSource::kWaitRegMem,
+                                  physical_address, 4);
   PublishOnDemandMemexport();
   memory_->ProvidePhysicalMemory(physical_address, 4);
   for (const auto& [address, size] : memexport_batch_ranges_) {

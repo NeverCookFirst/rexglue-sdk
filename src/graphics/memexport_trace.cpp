@@ -58,6 +58,21 @@ struct ReadStats {
   std::atomic<uint64_t> bytes{0};
 };
 
+struct ResolveKey {
+  uint32_t address;
+  uint32_t size;
+  bool scaled;
+
+  auto AsTuple() const { return std::tie(address, size, scaled); }
+  bool operator<(const ResolveKey& other) const { return AsTuple() < other.AsTuple(); }
+};
+
+struct ResolveStats {
+  uint64_t calls = 0;
+  uint64_t cache_misses = 0;
+  uint64_t guest_copies = 0;
+};
+
 std::atomic<bool> active{false};
 std::atomic<bool> waiting_for_frame_boundary{false};
 std::atomic<uint32_t> frames_remaining{0};
@@ -65,6 +80,7 @@ std::array<std::atomic<uint64_t>, kPageWordCount> exported_pages{};
 std::array<std::atomic<uint64_t>, kPageWordCount> previous_exported_pages{};
 std::mutex detail_mutex;
 std::map<DrawKey, DrawStats> draws;
+std::map<ResolveKey, ResolveStats> resolves;
 std::map<std::string, uint64_t> publish_reasons;
 ReadStats cpu_vertex_reads;
 ReadStats wait_reg_mem_reads;
@@ -75,6 +91,7 @@ void ClearStatistics() {
   {
     std::lock_guard<std::mutex> lock(detail_mutex);
     draws.clear();
+    resolves.clear();
     publish_reasons.clear();
   }
   for (ReadStats* stats : {&cpu_vertex_reads, &wait_reg_mem_reads, &data_provider_reads,
@@ -208,6 +225,18 @@ void RecordPublish(const char* reason) {
   ++publish_reasons[reason ? reason : "unknown"];
 }
 
+void RecordResolve(uint32_t address, uint32_t size, bool scaled, bool cache_miss,
+                   bool copied_to_guest) {
+  if (!IsActive()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(detail_mutex);
+  ResolveStats& stats = resolves[{address, size, scaled}];
+  ++stats.calls;
+  stats.cache_misses += cache_miss ? 1 : 0;
+  stats.guest_copies += copied_to_guest ? 1 : 0;
+}
+
 void EndFrame() {
   if (waiting_for_frame_boundary.exchange(false, std::memory_order_acq_rel)) {
     ClearStatistics();
@@ -221,14 +250,19 @@ void EndFrame() {
   }
 
   std::vector<std::pair<DrawKey, DrawStats>> draw_snapshot;
+  std::vector<std::pair<ResolveKey, ResolveStats>> resolve_snapshot;
   std::map<std::string, uint64_t> publish_snapshot;
   {
     std::lock_guard<std::mutex> lock(detail_mutex);
     draw_snapshot.assign(draws.begin(), draws.end());
+    resolve_snapshot.assign(resolves.begin(), resolves.end());
     publish_snapshot = publish_reasons;
   }
   std::sort(draw_snapshot.begin(), draw_snapshot.end(), [](const auto& a, const auto& b) {
     return a.second.draws > b.second.draws;
+  });
+  std::sort(resolve_snapshot.begin(), resolve_snapshot.end(), [](const auto& a, const auto& b) {
+    return a.second.calls > b.second.calls;
   });
 
   uint64_t exported_page_count = 0;
@@ -244,6 +278,13 @@ void EndFrame() {
       bytes(cpu_vertex_reads) >> 10, count(wait_reg_mem_reads), bytes(wait_reg_mem_reads) >> 10,
       count(data_provider_reads), bytes(data_provider_reads) >> 10, count(cpu_writes),
       bytes(cpu_writes) >> 10);
+  for (const auto& [key, stats] : resolve_snapshot) {
+    REXGPU_INFO(
+        "memexport_trace:   resolve address={:08X} size={} KB scaled={} calls={} stalls={} "
+        "guest-copies={}",
+        key.address, key.size >> 10, key.scaled, stats.calls, stats.cache_misses,
+        stats.guest_copies);
+  }
   for (const auto& [key, stats] : draw_snapshot) {
     REXGPU_INFO(
         "memexport_trace:   VS={:016X}{} PS={:016X}{} draws={} vertices={} ranges={} bytes={} KB",

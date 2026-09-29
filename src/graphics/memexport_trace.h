@@ -31,6 +31,8 @@ void RecordRange(uint32_t address, uint32_t size);
 void RecordHostRead(HostReadSource source, uint32_t address, uint32_t size);
 void RecordCpuWrite(uint32_t address_first, uint32_t address_last);
 void RecordPublish(const char* reason);
+void RecordResolve(uint32_t address, uint32_t size, bool scaled, bool cache_miss,
+                   bool copied_to_guest);
 void EndFrame();
 
 }  // namespace rex::graphics::memexport_trace

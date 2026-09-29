@@ -3869,6 +3869,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   // above, and that time lands in kFenceWait.
   frame_stats::Add(frame_stats::kReadbackResolve, is_cache_miss ? 1 : 0, written_length);
   bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
+  memexport_trace::RecordResolve(written_address, written_length, is_scaled, is_cache_miss,
+                                 should_copy);
   if (should_copy && rb.buffers[read_index] && written_length <= rb.sizes[read_index] &&
       rb.mapped_data[read_index]) {
     uint8_t* destination = memory_->TranslatePhysical(written_address);

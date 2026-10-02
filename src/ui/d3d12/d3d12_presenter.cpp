@@ -41,6 +41,20 @@ REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D
                     "flag is fixed when the swap chain is created.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// Players kept reporting that fullscreen (borderless) stutters - portal loads
+// turning into a slide show - while the same machine is smooth in a window.
+// In a window DWM takes every frame without waiting. Covering the whole
+// monitor makes the swap chain eligible for independent flip, and then Present
+// waits for the display to give a buffer back. That wait sat on the UI thread
+// with paint_mode_mutex_ held, and the guest's frame hand-off takes the same
+// mutex, so the game itself stalled behind the monitor. With the waitable
+// object a paint is skipped instead whenever no buffer is free, and Present
+// never has to wait.
+REXCVAR_DEFINE_BOOL(d3d12_present_skip_when_busy, true, "UI/D3D12",
+                    "Skip a repaint instead of blocking when the display has no free buffer "
+                    "(fixes stutter in fullscreen). Takes effect on the next start.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 // Defined in presenter.cpp - same library, shared with any other backend.
 REXCVAR_DECLARE(int32_t, present_max_output_height);
 
@@ -391,7 +405,10 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     }
     bool swap_chain_resized = SUCCEEDED(paint_context_.swap_chain->ResizeBuffers(
         0, UINT(new_swap_chain_width), UINT(new_swap_chain_height), DXGI_FORMAT_UNKNOWN,
-        paint_context_.swap_chain_allows_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0));
+        (paint_context_.swap_chain_allows_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0) |
+            (paint_context_.swap_chain_frame_latency_waitable
+                 ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+                 : 0)));
     if (swap_chain_resized) {
       for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
         if (FAILED(paint_context_.swap_chain->GetBuffer(
@@ -441,6 +458,9 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
       // rate.
       swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     }
+    if (REXCVAR_GET(d3d12_present_skip_when_busy)) {
+      swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    }
     IDXGIFactory2* dxgi_factory = provider_.GetDXGIFactory();
     ID3D12CommandQueue* direct_queue = provider_.GetDirectQueue();
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain_1;
@@ -478,6 +498,18 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     paint_context_.swap_chain_height = new_swap_chain_height;
     paint_context_.swap_chain_allows_tearing =
         (swap_chain_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+    if (swap_chain_desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
+      Microsoft::WRL::ComPtr<IDXGISwapChain2> swap_chain_2;
+      if (SUCCEEDED(paint_context_.swap_chain.As(&swap_chain_2))) {
+        // Two frames in flight: enough to keep the GPU busy, few enough that a
+        // skipped repaint is the worst outcome of the display falling behind.
+        swap_chain_2->SetMaximumFrameLatency(2);
+        paint_context_.swap_chain_frame_latency_waitable =
+            swap_chain_2->GetFrameLatencyWaitableObject();
+      }
+      REXLOG_INFO("D3D12Presenter: present skips when the display is busy ({})",
+                  paint_context_.swap_chain_frame_latency_waitable ? "on" : "unavailable");
+    }
     for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
       if (FAILED(paint_context_.swap_chain->GetBuffer(
               i, IID_PPV_ARGS(&paint_context_.swap_chain_buffers[i])))) {
@@ -577,12 +609,24 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
     swap_chain_buffer_ref.Reset();
   }
   swap_chain.Reset();
+  if (swap_chain_frame_latency_waitable) {
+    CloseHandle(swap_chain_frame_latency_waitable);
+    swap_chain_frame_latency_waitable = nullptr;
+  }
   swap_chain_allows_tearing = false;
   swap_chain_height = 0;
   swap_chain_width = 0;
 }
 
 Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+  // No free buffer: skip this repaint rather than let Present block. The next
+  // guest frame or UI tick paints again. See d3d12_present_skip_when_busy.
+  if (paint_context_.swap_chain_frame_latency_waitable &&
+      WaitForSingleObjectEx(paint_context_.swap_chain_frame_latency_waitable, 0, FALSE) !=
+          WAIT_OBJECT_0) {
+    return PaintResult::kNotPresented;
+  }
+
   // Begin the command list with the command allocator not currently potentially
   // used on the GPU.
   UINT64 current_paint_submission = paint_context_.paint_submission_tracker.GetCurrentSubmission();

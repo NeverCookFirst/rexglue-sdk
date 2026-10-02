@@ -156,11 +156,18 @@ bool WriteDumpImpl(PEXCEPTION_POINTERS ex_info, const char* prefix) {
                     static_cast<uint32_t>(GetLastError()));
     return false;
   }
+  // MINIDUMP_EXCEPTION_INFORMATION is declared under pshpack4.h: the pointer
+  // sits at offset 4, not 8. Without the pack dbghelp read half a thread id
+  // and half a pointer, and every crash dump failed with ERROR_NOACCESS
+  // (0x800703E6) while hang dumps, which pass no exception, worked.
+#pragma pack(push, 4)
   struct {
     DWORD thread_id;
     PEXCEPTION_POINTERS exception_pointers;
     BOOL client_pointers;
   } dump_info = {GetCurrentThreadId(), ex_info, FALSE};
+#pragma pack(pop)
+  static_assert(sizeof(dump_info) == 16, "must match MINIDUMP_EXCEPTION_INFORMATION");
   void* info = ex_info ? &dump_info : nullptr;
   // MiniDumpWithFullMemory failed on every machine and left a 0-byte file:
   // the guest arena is several GB mapped through more than one view. Stacks,

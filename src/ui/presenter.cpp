@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <atomic>
 #include <cctype>
 #include <utility>
@@ -1447,7 +1449,10 @@ void Presenter::UpdateSurfaceMonitorFromUIThread(bool old_monitor_potentially_di
     // The HWND may be non-existent if the window has been closed and destroyed
     // (the HWND, not the rex::ui::Window) already.
     if (hwnd) {
-      surface_new_win32_monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+      // NEAREST, not NULL: a window started straight in fullscreen can be
+      // asked before Windows considers it on a monitor, and a null here left
+      // the UI repainting with no vblank limit for the whole session.
+      surface_new_win32_monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
     }
   }
   if (old_monitor_potentially_disconnected || surface_win32_monitor_ != surface_new_win32_monitor) {
@@ -1483,6 +1488,9 @@ void Presenter::UpdateSurfaceMonitorFromUIThread(bool old_monitor_potentially_di
       std::unique_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
       bool dxgi_output_was_null = (dxgi_ui_tick_output_ == nullptr);
       dxgi_ui_tick_output_ = new_dxgi_output;
+      REXLOG_INFO("Presenter: UI repaint pacing {}",
+                  new_dxgi_output ? "follows the monitor's vblank"
+                                  : "has no vblank source, using a timer");
       signal_dxgi_ui_tick_control =
           dxgi_output_was_null && AreDXGIUITicksWaitable(dxgi_ui_tick_lock);
     }
@@ -1601,6 +1609,28 @@ void Presenter::WaitForUITickFromUIThread() {
       return;
     }
     if (!AreDXGIUITicksWaitable(dxgi_ui_tick_lock)) {
+      // No vblank to wait for. Returning straight away used to mean repainting
+      // as fast as the GPU allowed - each repaint a full upscale on the guest's
+      // own queue - which halved the game's frame rate in fullscreen until an
+      // Alt+Enter happened to find the monitor. Pace by the refresh rate.
+      dxgi_ui_tick_lock.unlock();
+      static const auto kFallbackInterval = [] {
+        DEVMODEW mode{};
+        mode.dmSize = sizeof(mode);
+        DWORD hz = EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode)
+                       ? mode.dmDisplayFrequency
+                       : 0;
+        if (hz < 30 || hz > 500) {
+          hz = 60;
+        }
+        return std::chrono::microseconds(1000000 / hz);
+      }();
+      static thread_local auto next_paint = std::chrono::steady_clock::now();
+      const auto now = std::chrono::steady_clock::now();
+      if (next_paint > now) {
+        std::this_thread::sleep_until(next_paint);
+      }
+      next_paint = std::max(next_paint, now) + kFallbackInterval;
       return;
     }
     if (dxgi_ui_tick_last_vblank_ > dxgi_ui_tick_last_draw_) {

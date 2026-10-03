@@ -42,6 +42,7 @@
 #include <rex/ui/d3d12/d3d12_util.h>
 
 #include "../memexport_trace.h"
+#include "../gpu_inventory.h"
 
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -2188,6 +2189,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   }
   FlushMemexportReadbackBatch("swap");
   memexport_trace::EndFrame();
+  gpu_inventory::EndFrame();
   ReportSlowFrame();
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
@@ -2619,6 +2621,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       return true;
     }
   }
+  if (gpu_inventory::IsActive()) {
+    gpu_inventory::Record(fmt::format("shader_pair_seen vs={:016X} ps={:016X}",
+        vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0));
+  }
   if (pixel_shader) {
     if (FrameStats().armed.load(std::memory_order_relaxed)) {
       FrameStats().Record(pixel_shader->ucode_data_hash(), index_count);
@@ -2629,6 +2635,21 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
+  if (gpu_inventory::IsTilingTraceActive())
+    gpu_inventory::TraceTilingDetail(fmt::format("draw vs={:016X} ps={:016X} indices={}",
+        vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+        index_count));
+  if (gpu_inventory::IsActive()) {
+    gpu_inventory::Record(fmt::format(
+        "draw_attempt vs={:016X} ps={:016X} primitive={} vs_export={} ps_export={}",
+        vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+        uint32_t(primitive_type), memexport_used_vertex, memexport_used_pixel));
+    for (uint32_t i = 0; i < 4; ++i)
+      gpu_inventory::Record(fmt::format("rt slot={} raw={:08X}", i,
+          regs[reg::RB_COLOR_INFO::rt_register_indices[i]]));
+    gpu_inventory::Record(fmt::format("depth raw={:08X} surface={:08X}",
+        regs[reg::RB_DEPTH_INFO::register_index], regs[reg::RB_SURFACE_INFO::register_index]));
+  }
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
   if (!BeginSubmission(true)) {
@@ -2712,6 +2733,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   texture_cache_->RequestTextures(used_texture_mask);
+  if (gpu_inventory::IsActive()) {
+    for (uint32_t i = 0; i < 32; ++i) {
+      if (!(used_texture_mask & (uint32_t(1) << i))) continue;
+      const auto fetch = regs.GetTextureFetch(i);
+      gpu_inventory::Record(fmt::format("texture slot={} format={} dimension={} tiled={} packed_mips={}",
+          i, uint32_t(fetch.format), uint32_t(fetch.dimension), uint32_t(fetch.tiled),
+          uint32_t(fetch.packed_mips)));
+    }
+  }
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
@@ -3632,6 +3662,11 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
 }
 
 bool D3D12CommandProcessor::IssueCopy() {
+  if (gpu_inventory::IsActive()) {
+    gpu_inventory::Record(fmt::format("resolve_attempt control={:08X} dest_info={:08X}",
+        (*register_file_)[reg::RB_COPY_CONTROL::register_index],
+        (*register_file_)[reg::RB_COPY_DEST_INFO::register_index]));
+  }
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES

@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include "gpu_inventory.h"
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -797,6 +798,10 @@ bool CommandProcessor::ExecutePacketType2(memory::RingBuffer* reader, uint32_t p
 }
 
 bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t packet) {
+  if (gpu_inventory::IsActive()) {
+    gpu_inventory::Record(fmt::format("pm4_seen opcode={:02X} predicated={}",
+                                     (packet >> 8) & 0x7F, packet & 1));
+  }
   // Type-3 packet.
   uint32_t opcode = (packet >> 8) & 0x7F;
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
@@ -811,6 +816,8 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   // & 1 == predicate - when set, we do bin check to see if we should execute
   // the packet. Only type 3 packets are affected.
   // We also skip predicated swaps, as they are never valid (probably?).
+  if (opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2)
+    gpu_inventory::TraceTilingPacket(*register_file_, packet, bin_mask_, bin_select_);
   if (packet & 1) {
     bool any_pass = (bin_select_ & bin_mask_) != 0;
     if (!any_pass || opcode == PM4_XE_SWAP) {

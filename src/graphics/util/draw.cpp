@@ -25,6 +25,7 @@
 #include <rex/math.h>
 #include <rex/memory.h>
 #include <rex/ui/graphics_util.h>
+#include "../gpu_inventory.h"
 
 REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "GPU", "Enable half pixel offset");
 
@@ -1097,6 +1098,23 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   info_out.rb_depth_clear = regs[XE_GPU_REG_RB_DEPTH_CLEAR];
   info_out.rb_color_clear = regs[XE_GPU_REG_RB_COLOR_CLEAR];
   info_out.rb_color_clear_lo = regs[XE_GPU_REG_RB_COLOR_CLEAR_LO];
+
+  if (gpu_inventory::IsTilingTraceActive()) {
+    gpu_inventory::TraceTilingDetail(fmt::format(
+        "resolve src={} rect={},{},{},{} base={:08X} adjusted={:08X} "
+        "extent={:08X}..{:08X} offset={},{} format={} exp={} number={} "
+        "clear_color={} clear_depth={} vertices={},{},{},{},{},{}",
+        uint32_t(rb_copy_control.copy_src_select), x0, y0, x1, y1,
+        rb_copy_dest_base, copy_dest_base_adjusted, copy_dest_extent_start, copy_dest_extent_end,
+        uint32_t(info_out.copy_dest_coordinate_info.offset_x_div_8) * 8,
+        uint32_t(info_out.copy_dest_coordinate_info.offset_y_div_8) * 8,
+        uint32_t(dest_format), int32_t(rb_copy_dest_info.copy_dest_exp_bias),
+        uint32_t(rb_copy_dest_info.copy_dest_number),
+        uint32_t(rb_copy_control.color_clear_enable), uint32_t(rb_copy_control.depth_clear_enable),
+        xenos::GpuSwap(vertices_guest[0], fetch.endian), xenos::GpuSwap(vertices_guest[1], fetch.endian),
+        xenos::GpuSwap(vertices_guest[2], fetch.endian), xenos::GpuSwap(vertices_guest[3], fetch.endian),
+        xenos::GpuSwap(vertices_guest[4], fetch.endian), xenos::GpuSwap(vertices_guest[5], fetch.endian)));
+  }
 
   REXGPU_TRACE(
       "Resolve: {},{} <= x,y < {},{}, {} -> {} at 0x{:08X} (potentially "

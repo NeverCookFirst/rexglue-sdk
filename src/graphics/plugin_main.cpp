@@ -38,6 +38,13 @@ extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
   }
 
   std::string_view backend = info->backend ? info->backend : "any";
+  // A config can carry a value no build understands (seen in the wild: the
+  // plugin's own name, 'xenos'). Refusing it leaves the game unable to start
+  // at all, so anything that is not a known backend means "any".
+  if (backend != "any" && backend != "d3d12" && backend != "vulkan") {
+    REXLOG_WARN("rexgpu-xenos: unknown backend '{}', using the default", backend);
+    backend = "any";
+  }
 #if REX_HAS_D3D12
   if (backend == "any" || backend == "d3d12") {
     return new rex::graphics::d3d12::D3D12GraphicsSystem();

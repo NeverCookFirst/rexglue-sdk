@@ -208,6 +208,10 @@ class BaseHeap {
   // Queries information about the given region of pages.
   bool QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info);
 
+  // Check only the requested bytes, including commitment and protection of
+  // every intersecting page. Does not scan the rest of the allocation.
+  bool IsRangeCommittedReadable(uint32_t address, uint32_t length);
+
   // Queries the size of the region containing the given address.
   bool QuerySize(uint32_t address, uint32_t* out_size);
 

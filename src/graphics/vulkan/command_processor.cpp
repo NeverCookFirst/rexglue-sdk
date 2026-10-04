@@ -47,6 +47,63 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+#include <array>
+#include <chrono>
+
+#include "../frame_stats.h"
+
+REXCVAR_DECLARE(uint32_t, readback_resolve_max_kb);
+REXCVAR_DECLARE(uint32_t, slow_frame_log_ms);
+
+namespace {
+// Vulkan twin of the D3D12 slow-frame report (same line format, so the same
+// tooling reads both): on every swap, if the frame that just ended took longer
+// than slow_frame_log_ms, log what the command thread spent it on.
+void ReportSlowFrameVulkan() {
+  using clock = std::chrono::steady_clock;
+  namespace fs = rex::graphics::frame_stats;
+  static clock::time_point last_swap{};
+  static uint64_t frame_index = 0;
+  const clock::time_point now = clock::now();
+  const uint32_t threshold_ms = REXCVAR_GET(slow_frame_log_ms);
+  struct Snap {
+    uint64_t count, us, extra;
+  };
+  std::array<Snap, fs::kCount> s;
+  for (uint32_t i = 0; i < fs::kCount; ++i) {
+    auto& c = fs::Counters()[i];
+    s[i] = {c.count.exchange(0, std::memory_order_relaxed),
+            c.us.exchange(0, std::memory_order_relaxed),
+            c.extra.exchange(0, std::memory_order_relaxed)};
+  }
+  const bool first = last_swap == clock::time_point{};
+  const uint64_t frame_us =
+      first ? 0
+            : uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now - last_swap)
+                           .count());
+  last_swap = now;
+  ++frame_index;
+  if (!threshold_ms || first || frame_us < uint64_t(threshold_ms) * 1000) {
+    return;
+  }
+  auto ms = [](uint64_t us) { return double(us) / 1000.0; };
+  REXGPU_INFO(
+      "slow frame #{} (vulkan): {:.1f} ms | gpu-thread idle {:.1f} | host-gpu wait {:.1f} ({}x) | "
+      "shader translate {:.1f} ({}x) | pipeline create {:.1f} ({}x), new {} | "
+      "texture load {:.1f} ({}x) | readback {}x {} KB | "
+      "cpu-write invalidations {}x {} KB",
+      frame_index, ms(frame_us), ms(s[fs::kCpIdle].us), ms(s[fs::kFenceWait].us),
+      s[fs::kFenceWait].count, ms(s[fs::kShaderTranslate].us), s[fs::kShaderTranslate].count,
+      ms(s[fs::kPipelineCreate].us), s[fs::kPipelineCreate].count, s[fs::kPipelineMiss].count,
+      ms(s[fs::kTextureLoad].us), s[fs::kTextureLoad].count, s[fs::kReadbackResolve].count,
+      s[fs::kReadbackResolve].extra / 1024, s[fs::kMemoryInvalidate].count,
+      s[fs::kMemoryInvalidate].extra / 1024);
+}
+}  // namespace
+
+REXCVAR_DEFINE_BOOL(vulkan_integer_scale, true, "GPU/Vulkan",
+                    "Scale integer-format texture fetches to the guest integer range, as "
+                    "D3D12 does.");
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -2272,6 +2329,7 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  ReportSlowFrameVulkan();
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -4415,6 +4473,15 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     return true;
   }
 
+  // Same cap as D3D12: the game only needs small resolves on the CPU. Reading
+  // the 1280x720 16_16_16_16 HDR scene buffer back every frame wrote a frame-old
+  // copy into guest memory, which then got uploaded over the GPU's own result
+  // and the scene sampled the stale data - the white blow-out on Vulkan.
+  uint32_t readback_max_kb = REXCVAR_GET(readback_resolve_max_kb);
+  if (readback_max_kb && uint64_t(written_length) > uint64_t(readback_max_kb) * 1024) {
+    return true;
+  }
+
   if (!memory_->TranslatePhysical(written_address)) {
     return true;
   }
@@ -4423,6 +4490,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     return true;
   }
+  frame_stats::Add(frame_stats::kReadbackResolve, 0, written_length);
 
   auto ensure_readback_slot = [&](ReadbackBuffer& readback, uint32_t index, uint32_t size) -> bool {
     if (readback.buffers[index] != VK_NULL_HANDLE && size <= readback.sizes[index] &&
@@ -4970,6 +5038,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
+    frame_stats::Scope fence_scope(frame_stats::kFenceWait);
     VkResult wait_result =
         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
@@ -6180,7 +6249,9 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       dirty |= (texture_signs_uint & texture_signs_mask) != texture_signs_shifted;
       texture_signs_uint = (texture_signs_uint & ~texture_signs_mask) | texture_signs_shifted;
       uint32_t texture_integer_scale_bits =
-          texture_cache_->GetActiveIntegerScaleBits(texture_index);
+          REXCVAR_GET(vulkan_integer_scale)
+              ? texture_cache_->GetActiveIntegerScaleBits(texture_index)
+              : 0;
       dirty |= system_constants_.texture_integer_scale_bits[texture_index] !=
                texture_integer_scale_bits;
       system_constants_.texture_integer_scale_bits[texture_index] = texture_integer_scale_bits;

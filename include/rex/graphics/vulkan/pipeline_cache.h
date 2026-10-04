@@ -94,6 +94,9 @@ class VulkanPipelineCache {
       VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
       const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr);
   bool IsCreatingPipelines() const;
+  // Pipelines queued for async creation and finished since the queue was last
+  // empty, for the "compiling shaders" notice. False when nothing is pending.
+  bool GetCompileProgress(uint32_t& done, uint32_t& total) const;
   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
                                     const PipelineLayoutProvider*& pipeline_layout_out,
                                     bool* is_placeholder_out = nullptr) const;
@@ -458,6 +461,19 @@ class VulkanPipelineCache {
   std::unique_ptr<rex::thread::Thread> storage_write_thread_;
 
   mutable std::mutex creation_request_lock_;
+  // Driver-level pipeline cache, persisted next to the .xpso so repeat
+  // sessions skip the driver compile. Not part of the shareable storage.
+  void LoadVkPipelineCache(const std::filesystem::path& path);
+  void SaveVkPipelineCache();
+  VkPipelineCache vk_pipeline_cache_ = VK_NULL_HANDLE;
+  std::filesystem::path vk_pipeline_cache_path_;
+  std::mutex vk_pipeline_cache_save_mutex_;
+  uint64_t vk_pipeline_cache_last_save_ms_ = 0;
+  PFN_vkCreatePipelineCache pfn_create_pipeline_cache_ = nullptr;
+  PFN_vkDestroyPipelineCache pfn_destroy_pipeline_cache_ = nullptr;
+  PFN_vkGetPipelineCacheData pfn_get_pipeline_cache_data_ = nullptr;
+  uint32_t compile_progress_done_ = 0;
+  uint32_t compile_progress_total_ = 0;
   std::condition_variable creation_request_cond_;
   std::priority_queue<PipelineCreationArguments, std::vector<PipelineCreationArguments>,
                       PipelineCreationArgumentsPriorityComparator>

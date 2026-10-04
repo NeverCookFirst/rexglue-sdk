@@ -1423,6 +1423,19 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             spv::NoPrecision);
         spv::Id fetch_constant_word_4_signed =
             builder_->createUnaryOp(spv::OpBitcast, type_int_, fetch_constant_word_4);
+        // Word 3 holds the result exponent bias (exp_adjust, bits 13:18).
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(const_int_0_);
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
+        spv::Id fetch_constant_word_3_signed = builder_->createUnaryOp(
+            spv::OpBitcast, type_int_,
+            builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                             uniform_fetch_constants_,
+                                                             id_vector_temp_),
+                                 spv::NoPrecision));
 
         // Accumulate the explicit LOD (or LOD bias) sources (in D3D11.3
         // specification order: specified LOD + sampler LOD bias + instruction
@@ -2045,11 +2058,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         {
           // Uniform early out. Zero means leave the sample alone. Only integer
           // num_format on fixed textures has scale bits.
-          // 2026-09-10: integer-scale disabled pending a fix. As ported it
-          // multiplies 16-bit texture samples by 65535 and blows the world out
-          // to white on Vulkan. Off = correct colour but darker than intended.
-          spv::Id integer_scale_active = builder_->makeBoolConstant(false);
-          (void)integer_scale_bits_packed;
+          // The command processor zeroes the bits unless vulkan_integer_scale
+          // is on (it blew the world out to white on 2026-09-10).
+          spv::Id integer_scale_active =
+              builder_->createBinOp(spv::OpINotEqual, type_bool_, integer_scale_bits_packed,
+                                    builder_->makeUintConstant(0));
           SpirvBuilder::IfBuilder if_integer_scale(integer_scale_active,
                                                    spv::SelectionControlMaskNone, *builder_);
           spv::Id scaled_result[4] = {};
@@ -2114,10 +2127,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         }
 
         // Apply the exponent bias from the bits 13:18 of the fetch constant
-        // word 4.
+        // word 3 (it used to read word 4 - the LOD bias - so Vulkan ignored
+        // exp_adjust: the HDR buffer came out 8x dark, or white once scaled).
         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
+            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
         {
           uint32_t result_remaining_components = used_result_nonzero_components;

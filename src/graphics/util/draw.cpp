@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <set>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -20,6 +21,9 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/logging.h>
+
+REXCVAR_DECLARE(bool, gpu_integer_scale_log);
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -1208,6 +1212,26 @@ ResolveCopyShaderIndex ResolveInfo::GetCopyShader(uint32_t draw_resolution_scale
     group_count_y_out = 0;
   }
 
+  if (REXCVAR_GET(gpu_integer_scale_log) && !is_depth) {
+    static std::set<uint64_t> logged;
+    uint64_t id = uint64_t(color_edram_info.format) | (uint64_t(copy_dest_info.copy_dest_format) << 8) |
+                  (uint64_t(copy_dest_info.copy_dest_number) << 16) |
+                  (uint64_t(copy_dest_info.copy_dest_endian) << 20) |
+                  (uint64_t(copy_dest_info.copy_dest_exp_bias & 63) << 24) | (uint64_t(shader) << 32) |
+                  (uint64_t(copy_dest_base >> 12) << 36) |
+                  (uint64_t(color_edram_info.base_tiles) << 52);
+    if (logged.size() < 400 && logged.insert(id).second) {
+      REXLOG_INFO("resolve: rt_format={} 64bpp={} dest_format={} number={} endian={} exp_bias={} "
+                  "shader={} dest_base={:08X} edram_base={} pitch={} msaa={}",
+                  uint32_t(color_edram_info.format), uint32_t(color_edram_info.format_is_64bpp),
+                  uint32_t(copy_dest_info.copy_dest_format),
+                  uint32_t(copy_dest_info.copy_dest_number),
+                  uint32_t(copy_dest_info.copy_dest_endian),
+                  int32_t(copy_dest_info.copy_dest_exp_bias), uint32_t(shader),
+                  copy_dest_base, uint32_t(color_edram_info.base_tiles),
+                  uint32_t(color_edram_info.pitch_tiles), uint32_t(color_edram_info.msaa_samples));
+    }
+  }
   return shader;
 }
 

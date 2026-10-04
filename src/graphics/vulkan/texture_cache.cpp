@@ -27,6 +27,8 @@
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/texture_cache.h>
+
+#include "../frame_stats.h"
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/mem_alloc.h>
@@ -1137,6 +1139,13 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
       }
     }
   }
+  if (key.format == xenos::TextureFormat::k_16_16_16_16 && key.GetWidth() >= 640) {
+    REXGPU_INFO("VulkanTextureCache: create k_16_16_16_16 {}x{} base {:08X} formats {} {} "
+                "signed_separate {} scaled_resolve {} tiled {} endian {}",
+                key.GetWidth(), key.GetHeight(), key.base_page << 12, int(formats[0]),
+                int(formats[1]), uint32_t(key.signed_separate), uint32_t(key.scaled_resolve),
+                uint32_t(key.tiled), uint32_t(key.endianness));
+  }
   if (formats[0] == VK_FORMAT_UNDEFINED) {
     unsupported_format_features_used_[uint32_t(key.format)] |= kUnsupportedResourceBit;
     return nullptr;
@@ -1215,6 +1224,7 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
 
 bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                bool load_mips) {
+  frame_stats::Scope load_scope(frame_stats::kTextureLoad);
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
 
@@ -2601,6 +2611,15 @@ bool VulkanTextureCache::Initialize() {
        host_format_16_16_16_16.format_signed.format == VK_FORMAT_R16G16B16A16_SNORM) ||
       (host_format_16_16_16_16.format_unsigned.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
        host_format_16_16_16_16.format_signed.format == VK_FORMAT_R16G16B16A16_SFLOAT);
+
+  REXGPU_INFO(
+      "VulkanTextureCache: k_16_16_16_16 -> unsigned {} (load {}), signed {} (load {}); "
+      "RGBA16_UNORM optimal features {:08X}",
+      int(host_format_16_16_16_16.format_unsigned.format),
+      int(host_format_16_16_16_16.format_unsigned.load_shader),
+      int(host_format_16_16_16_16.format_signed.format),
+      int(host_format_16_16_16_16.format_signed.load_shader),
+      uint32_t(r16g16b16a16_unorm_properties.optimalTilingFeatures));
 
   // Normalize format information structures.
   for (size_t i = 0; i < rex::countof(host_formats_); ++i) {

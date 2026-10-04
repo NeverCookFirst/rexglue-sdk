@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <fstream>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -41,6 +43,8 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
+
+#include "../frame_stats.h"
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
@@ -408,6 +412,8 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     }
   }
 
+  LoadVkPipelineCache(shader_storage_root / fmt::format("{:08X}.vk.cache", title_id));
+
   bool edram_fragment_shader_interlock =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
 
@@ -727,6 +733,13 @@ void VulkanPipelineCache::ShutdownShaderStorage() {
   storage_write_shader_queue_.clear();
   storage_write_pipeline_queue_.clear();
 
+  SaveVkPipelineCache();
+  if (vk_pipeline_cache_ != VK_NULL_HANDLE && pfn_destroy_pipeline_cache_) {
+    pfn_destroy_pipeline_cache_(command_processor_.GetVulkanDevice()->device(), vk_pipeline_cache_,
+                                nullptr);
+    vk_pipeline_cache_ = VK_NULL_HANDLE;
+  }
+
   if (pipeline_storage_file_) {
     fclose(pipeline_storage_file_);
     pipeline_storage_file_ = nullptr;
@@ -1020,6 +1033,7 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
   assert_false(register_file_.Get<reg::SQ_PROGRAM_CNTL>().gen_index_vtx);
   if (!vertex_shader->is_translated()) {
     vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
+    frame_stats::Scope translate_scope(frame_stats::kShaderTranslate);
     if (!TranslateAnalyzedShader(*shader_translator_, *vertex_shader)) {
       REXGPU_ERROR("Failed to translate the vertex shader!");
       return false;
@@ -1032,6 +1046,7 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
   if (pixel_shader != nullptr) {
     if (!pixel_shader->is_translated()) {
       pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
+      frame_stats::Scope translate_scope(frame_stats::kShaderTranslate);
       if (!TranslateAnalyzedShader(*shader_translator_, *pixel_shader)) {
         REXGPU_ERROR("Failed to translate the pixel shader!");
         return false;
@@ -1148,6 +1163,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
   }
 
   // Create the pipeline if not already existing.
+  frame_stats::Add(frame_stats::kPipelineMiss, 0);
   auto& pipeline = *pipelines_.emplace(description, Pipeline()).first;
   PipelineCreationArguments creation_arguments_real;
   if (!TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
@@ -1163,10 +1179,17 @@ bool VulkanPipelineCache::ConfigurePipeline(
     if (TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
                                                       creation_arguments_placeholder, true)) {
       pipeline.second.is_placeholder.store(true, std::memory_order_release);
-      if (EnsurePipelineCreated(creation_arguments_placeholder, placeholder_pixel_shader_)) {
+      bool placeholder_created;
+      {
+        frame_stats::Scope create_scope(frame_stats::kPipelineCreate);
+        placeholder_created =
+            EnsurePipelineCreated(creation_arguments_placeholder, placeholder_pixel_shader_);
+      }
+      if (placeholder_created) {
         {
           std::lock_guard<std::mutex> lock(creation_request_lock_);
           creation_queue_.push(creation_arguments_real);
+          ++compile_progress_total_;
         }
         creation_request_cond_.notify_one();
         queued_async_creation = true;
@@ -1176,7 +1199,12 @@ bool VulkanPipelineCache::ConfigurePipeline(
     }
   }
 
-  if (!queued_async_creation && !EnsurePipelineCreated(creation_arguments_real)) {
+  bool created_sync = queued_async_creation;
+  if (!queued_async_creation) {
+    frame_stats::Scope create_scope(frame_stats::kPipelineCreate);
+    created_sync = EnsurePipelineCreated(creation_arguments_real);
+  }
+  if (!created_sync) {
     pipelines_.erase(description);
     return false;
   }
@@ -1203,6 +1231,116 @@ bool VulkanPipelineCache::ConfigurePipeline(
     *pipeline_handle_out = &pipeline.second;
   }
   return pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr;
+}
+
+void VulkanPipelineCache::LoadVkPipelineCache(const std::filesystem::path& path) {
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& ifn = vulkan_device->vulkan_instance()->functions();
+  VkDevice device = vulkan_device->device();
+  pfn_create_pipeline_cache_ =
+      PFN_vkCreatePipelineCache(ifn.vkGetDeviceProcAddr(device, "vkCreatePipelineCache"));
+  pfn_destroy_pipeline_cache_ =
+      PFN_vkDestroyPipelineCache(ifn.vkGetDeviceProcAddr(device, "vkDestroyPipelineCache"));
+  pfn_get_pipeline_cache_data_ =
+      PFN_vkGetPipelineCacheData(ifn.vkGetDeviceProcAddr(device, "vkGetPipelineCacheData"));
+  if (!pfn_create_pipeline_cache_ || !pfn_destroy_pipeline_cache_ ||
+      !pfn_get_pipeline_cache_data_) {
+    return;
+  }
+  vk_pipeline_cache_path_ = path;
+
+  // Only hand the driver data written by this exact device and driver - the
+  // header carries vendor, device and the driver's cache UUID.
+  std::vector<char> data;
+  {
+    std::ifstream in(path, std::ios::binary);
+    if (in) {
+      data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+  }
+  if (!data.empty()) {
+    VkPhysicalDeviceProperties props;
+    ifn.vkGetPhysicalDeviceProperties(vulkan_device->physical_device(), &props);
+    struct Header {
+      uint32_t length, version, vendor_id, device_id;
+      uint8_t uuid[VK_UUID_SIZE];
+    } header;
+    bool valid = data.size() >= sizeof(header);
+    if (valid) {
+      std::memcpy(&header, data.data(), sizeof(header));
+      valid = header.length >= sizeof(header) &&
+              header.version == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+              header.vendor_id == props.vendorID && header.device_id == props.deviceID &&
+              !std::memcmp(header.uuid, props.pipelineCacheUUID, VK_UUID_SIZE);
+    }
+    if (!valid) {
+      REXGPU_INFO("VulkanPipelineCache: driver pipeline cache is from another GPU or driver, "
+                  "starting fresh");
+      data.clear();
+    }
+  }
+
+  VkPipelineCacheCreateInfo create_info = {};
+  create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+  create_info.initialDataSize = data.size();
+  create_info.pInitialData = data.empty() ? nullptr : data.data();
+  if (pfn_create_pipeline_cache_(device, &create_info, nullptr, &vk_pipeline_cache_) !=
+      VK_SUCCESS) {
+    create_info.initialDataSize = 0;
+    create_info.pInitialData = nullptr;
+    if (pfn_create_pipeline_cache_(device, &create_info, nullptr, &vk_pipeline_cache_) !=
+        VK_SUCCESS) {
+      vk_pipeline_cache_ = VK_NULL_HANDLE;
+      return;
+    }
+  }
+  REXGPU_INFO("VulkanPipelineCache: driver pipeline cache {} ({} KB loaded)",
+              rex::path_to_utf8(path), data.size() >> 10);
+}
+
+void VulkanPipelineCache::SaveVkPipelineCache() {
+  if (vk_pipeline_cache_ == VK_NULL_HANDLE || !pfn_get_pipeline_cache_data_ ||
+      vk_pipeline_cache_path_.empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(vk_pipeline_cache_save_mutex_);
+  VkDevice device = command_processor_.GetVulkanDevice()->device();
+  size_t size = 0;
+  if (pfn_get_pipeline_cache_data_(device, vk_pipeline_cache_, &size, nullptr) != VK_SUCCESS ||
+      !size) {
+    return;
+  }
+  std::vector<char> data(size);
+  if (pfn_get_pipeline_cache_data_(device, vk_pipeline_cache_, &size, data.data()) !=
+      VK_SUCCESS) {
+    return;
+  }
+  // Write aside and rename, so a process killed mid-write can't leave a torn
+  // cache behind.
+  auto temp_path = vk_pipeline_cache_path_;
+  temp_path += ".tmp";
+  {
+    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      return;
+    }
+    out.write(data.data(), std::streamsize(size));
+    if (!out) {
+      return;
+    }
+  }
+  std::error_code ec;
+  std::filesystem::rename(temp_path, vk_pipeline_cache_path_, ec);
+}
+
+bool VulkanPipelineCache::GetCompileProgress(uint32_t& done, uint32_t& total) const {
+  std::lock_guard<std::mutex> lock(creation_request_lock_);
+  if (!compile_progress_total_) {
+    return false;
+  }
+  done = compile_progress_done_;
+  total = compile_progress_total_;
+  return true;
 }
 
 bool VulkanPipelineCache::IsCreatingPipelines() const {
@@ -3480,7 +3618,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   VkPipeline pipeline;
-  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1,
                                                          &pipeline_create_info, nullptr, &pipeline);
   if (create_result != VK_SUCCESS) {
     uint64_t ps_hash = creation_arguments.pixel_shader
@@ -3556,6 +3694,10 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       --creation_threads_busy_;
+      if (++compile_progress_done_ >= compile_progress_total_) {
+        compile_progress_done_ = 0;
+        compile_progress_total_ = 0;
+      }
     }
   }
 }
@@ -3586,6 +3728,9 @@ void VulkanPipelineCache::CreateQueuedPipelinesOnProcessorThread() {
       }
     }
   }
+  std::lock_guard<std::mutex> lock(creation_request_lock_);
+  compile_progress_done_ = 0;
+  compile_progress_total_ = 0;
 }
 
 void VulkanPipelineCache::ProcessDeferredPipelineDestructions(bool force_all) {
@@ -3643,6 +3788,14 @@ void VulkanPipelineCache::StorageWriteThread() {
       flush_pipelines = false;
       assert_not_null(pipeline_storage_file_);
       fflush(pipeline_storage_file_);
+      // Steam Deck / Proton rarely exits cleanly, so don't only save on exit.
+      uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+      if (now_ms - vk_pipeline_cache_last_save_ms_ >= 30000) {
+        vk_pipeline_cache_last_save_ms_ = now_ms;
+        SaveVkPipelineCache();
+      }
     }
 
     const Shader* shader = nullptr;

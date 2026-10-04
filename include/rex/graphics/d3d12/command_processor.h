@@ -701,6 +701,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   // where the guest can learn the GPU progressed (fences, events, interrupts)
   // and before idling - the guest can't rely on the data any earlier.
   void PublishOnDemandMemexport();
+  // Publishes and waits for unpublished exports this draw's CPU-side reads
+  // (indices, vertex fetches) overlap. Called before the draw's submission.
+  void SyncOnDemandMemexportForDraw(const D3D12Shader& vertex_shader,
+                                    const IndexBufferInfo* index_buffer_info);
   std::atomic<uint64_t> on_demand_seq_{0};
   std::atomic<bool> on_demand_recording_{false};
   std::vector<OnDemandCpuWrite> on_demand_cpu_writes_;  // memexport_cpu_writes_mutex_

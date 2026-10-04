@@ -177,10 +177,23 @@ float ControlColumnX() { return 360.0f * FontScale(); }
 
 }  // namespace
 
-SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path)
-    : ImGuiDialog(imgui_drawer), config_path_(std::move(config_path)) {}
+// What the settings serialized to when F4 opened. Kept here rather than as a
+// member so the public header (and every exe built against it) stays the same.
+static std::string g_settings_on_open;
 
-SettingsDialog::~SettingsDialog() {}
+SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path)
+    : ImGuiDialog(imgui_drawer), config_path_(std::move(config_path)) {
+  g_settings_on_open = rex::cvar::SerializeToTOML();
+}
+
+// Closing F4 saves whatever changed. Steam Deck / Proton almost never exits
+// the game cleanly, so a save on exit never ran there and F4 changes were lost
+// unless "Save to config" was pressed (issue #1).
+SettingsDialog::~SettingsDialog() {
+  if (!config_path_.empty() && rex::cvar::SerializeToTOML() != g_settings_on_open) {
+    rex::cvar::SaveConfig(config_path_);
+  }
+}
 
 static const char* LifecycleBadge(rex::cvar::Lifecycle lc) {
   switch (lc) {

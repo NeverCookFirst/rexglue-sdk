@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <rex/assert.h>
@@ -25,6 +27,17 @@
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+
+namespace {
+// Diagnostics only: reach the guest memory without widening the public header.
+struct SharedMemoryPeek : rex::graphics::SharedMemory {
+  using rex::graphics::SharedMemory::memory;
+};
+}  // namespace
+
+REXCVAR_DEFINE_BOOL(gpu_integer_scale_log, false, "GPU",
+                    "Log every distinct texture fetch that gets an integer scale, once. "
+                    "Diagnostics for the Vulkan colour bug.");
 
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
                      "Texture cache memory limit for render-to-texture (MB)")
@@ -507,6 +520,35 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     binding.host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
     binding.integer_scale_bits =
         GetIntegerScaleBits(fetch.format, fetch.num_format, fetch.swizzle, binding.swizzled_signs);
+    if (REXCVAR_GET(gpu_integer_scale_log) && fetch.format == xenos::TextureFormat::k_16_16_16_16 &&
+        binding.key.GetWidth() >= 64) {
+    // Raw guest bits in the middle of the texture, sampled now and then, so
+    // the two backends can be compared on the same data.
+    static std::unordered_map<uint32_t, uint32_t> seen;
+    uint32_t& n = seen[fetch.base_address];
+    if (n < 960 && n++ % 120 == 0) {
+      uint32_t size = binding.key.GetWidth() * binding.key.GetHeight() * 8;
+      const uint32_t* p = static_cast<SharedMemoryPeek&>(shared_memory_).memory().TranslatePhysical<const uint32_t*>(
+          ((fetch.base_address << 12) + size / 2 + 0x100) & ~UINT32_C(0xFF));
+      REXLOG_INFO("tex16 data: base={:08X} bind#{} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                  fetch.base_address << 12, n - 1, p[0], p[1], p[2], p[3], p[4], p[5]);
+    }
+    }
+    if (binding.integer_scale_bits && REXCVAR_GET(gpu_integer_scale_log)) {
+      static std::unordered_set<uint64_t> logged;
+      uint64_t id = uint64_t(fetch.base_address) | (uint64_t(fetch.format) << 20) |
+                    (uint64_t(fetch.swizzle) << 26) | (uint64_t(binding.swizzled_signs) << 38) |
+                    (uint64_t(uint32_t(fetch.exp_adjust) & 63) << 46);
+      if (logged.insert(id).second) {
+        REXLOG_INFO(
+            "integer scale: tfetch{} fmt={} num_format={} swizzle={:03o} signs={:02X} "
+            "exp_adjust={} base={:08X} {}x{} dim={} bits={:06X}",
+            index, uint32_t(fetch.format), uint32_t(fetch.num_format), uint32_t(fetch.swizzle),
+            binding.swizzled_signs, int32_t(fetch.exp_adjust), uint32_t(fetch.base_address) << 12,
+            binding.key.GetWidth(), binding.key.GetHeight(), uint32_t(fetch.dimension),
+            binding.integer_scale_bits);
+      }
+    }
 
     // Check if need to load the unsigned and the signed versions of the texture
     // (if the format is emulated with different host bit representations for

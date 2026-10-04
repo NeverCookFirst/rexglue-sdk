@@ -72,7 +72,10 @@ REXCVAR_DEFINE_BOOL(readback_memexport_on_demand, false, "GPU/D3D12",
                     "draw: protect the exported pages and read the data back only when the "
                     "GPU has finished it or the game touches it first. Off = the old "
                     "synchronous path (a full CPU/GPU sync per exporting draw)")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(memexport_probe_log, false, "GPU/D3D12",
+                    "Diagnostics: log what on-demand memexport readback does (exports, "
+                    "overlaps, publishes, retires, guest faults, CPU writes). Capped.");
 REXCVAR_DEFINE_UINT32(slow_frame_log_ms, 0, "GPU/D3D12",
                       "Log a breakdown of every frame slower than this many milliseconds "
                       "(0 = off): GPU-thread idle, host GPU waits, shader/pipeline work, "
@@ -226,6 +229,10 @@ struct PixelShaderFrameStats {
     entries.clear();
   }
 };
+
+// Capped logger for memexport_probe_log.
+std::atomic<uint32_t> g_mx_probe_lines{0};
+#define MX_PROBE(...)                                                                do {                                                                                 if (REXCVAR_GET(memexport_probe_log) &&                                                 g_mx_probe_lines.fetch_add(1, std::memory_order_relaxed) < 6000) {                REXGPU_INFO("mxprobe " __VA_ARGS__);                                              }                                                                                } while (0)
 
 PixelShaderFrameStats& FrameStats() {
   static PixelShaderFrameStats stats;
@@ -2628,6 +2635,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
+  // On-demand memexport: the emulator itself reads this draw's index and
+  // vertex data on the CPU (primitive processing, CPU vertex shader for draw
+  // extents). It only sees published exports, so if this draw reads what an
+  // earlier draw exported but has not published yet, publish and wait now -
+  // before the submission opens, so nothing mid-draw is torn down. This is the
+  // read the 2026-09-28 bisect pinned the Springfield geometry spikes on.
+  if (on_demand_unpublished_) {
+    SyncOnDemandMemexportForDraw(*vertex_shader, index_buffer_info);
+  }
+
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -3113,6 +3130,23 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackOnDemand(uint32_t total_s
     deferred_command_list_.D3DCopyBufferRegion(batch.buffer.buffer, batch.used,
                                                shared_memory_buffer, address,
                                                memexport_range.size_bytes);
+    if (REXCVAR_GET(memexport_probe_log)) {
+      int overlap_batch = -1;
+      bool overlap_published = false;
+      for (size_t b = 0; b < on_demand_pending_.size(); ++b) {
+        for (const auto& [a, sz] : on_demand_pending_[b].ranges) {
+          if (a < address + memexport_range.size_bytes && address < a + sz) {
+            overlap_batch = int(b);
+            overlap_published = on_demand_pending_[b].published;
+          }
+        }
+      }
+      MX_PROBE("export frame={} sub={} addr={:08X} size={} batch#{} pending={} overlap_batch={} "
+               "overlap_published={}",
+               frame_current_, submission_current_, address, memexport_range.size_bytes,
+               on_demand_pending_.size() - 1, on_demand_pending_.size(), overlap_batch,
+               overlap_published);
+    }
     batch.ranges.emplace_back(address, memexport_range.size_bytes);
     batch.used += memexport_range.size_bytes;
     on_demand_seq_.fetch_add(1, std::memory_order_release);
@@ -3122,6 +3156,58 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackOnDemand(uint32_t total_s
   on_demand_recording_.store(true, std::memory_order_release);
   frame_stats::Add(frame_stats::kMemexportOnDemand, 0, total_size);
   return true;
+}
+
+void D3D12CommandProcessor::SyncOnDemandMemexportForDraw(
+    const D3D12Shader& vertex_shader, const IndexBufferInfo* index_buffer_info) {
+  constexpr uint32_t kPhysicalMask = 0x1FFFFFFF;
+  std::vector<std::pair<uint32_t, uint32_t>> reads;  // [first, end)
+  if (index_buffer_info && index_buffer_info->length) {
+    uint32_t first = index_buffer_info->guest_base & kPhysicalMask;
+    reads.emplace_back(first, first + uint32_t(index_buffer_info->length));
+  }
+  const RegisterFile& regs = *register_file_;
+  for (const Shader::VertexBinding& binding : vertex_shader.vertex_bindings()) {
+    xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(binding.fetch_constant);
+    uint32_t first = (fetch.address << 2) & kPhysicalMask;
+    uint32_t size = fetch.size << 2;
+    if (size) {
+      reads.emplace_back(first, first + size);
+    }
+  }
+  if (reads.empty()) {
+    return;
+  }
+  bool overlap = false;
+  {
+    std::lock_guard<std::mutex> lock(on_demand_mutex_);
+    for (const OnDemandReadback& batch : on_demand_pending_) {
+      if (batch.published) {
+        continue;
+      }
+      for (const auto& [address, size] : batch.ranges) {
+        uint32_t export_first = address & kPhysicalMask;
+        uint32_t export_end = export_first + size;
+        for (const auto& [read_first, read_end] : reads) {
+          if (read_first < export_end && export_first < read_end) {
+            overlap = true;
+            break;
+          }
+        }
+        if (overlap) {
+          break;
+        }
+      }
+      if (overlap) {
+        break;
+      }
+    }
+  }
+  if (overlap) {
+    MX_PROBE("predraw-sync frame={} reads={}", frame_current_, reads.size());
+    PublishOnDemandMemexport();
+    RetireOnDemandMemexport(true);
+  }
 }
 
 void D3D12CommandProcessor::PublishOnDemandMemexport() {
@@ -3166,6 +3252,8 @@ void D3D12CommandProcessor::PublishOnDemandMemexport() {
     }
   }
   on_demand_unpublished_ = false;
+  MX_PROBE("publish frame={} batches={} cpu_writes={}", frame_current_, on_demand_pending_.size(),
+           cpu_writes.size());
 }
 
 void D3D12CommandProcessor::RetireOnDemandMemexport(bool wait) {
@@ -3175,6 +3263,7 @@ void D3D12CommandProcessor::RetireOnDemandMemexport(bool wait) {
     return;
   }
   uint64_t completed = submission_fence_->GetCompletedValue();
+  const size_t mx_pending_before = on_demand_pending_.size();
   if (wait) {
     // Everything published is submitted, so this never waits on a thread.
     uint64_t await_submission = 0;
@@ -3208,16 +3297,22 @@ void D3D12CommandProcessor::RetireOnDemandMemexport(bool wait) {
       while (cursor < end) {
         uint32_t chunk_end = end;
         uint32_t skip_to = cursor;
-        for (const OnDemandCpuWrite& w : batch.cpu_writes) {
-          if (w.seq <= seq || w.address_last < cursor || w.address_first >= chunk_end) {
-            continue;
+        auto clip = [&](uint32_t first, uint32_t last) {
+          if (last < cursor || first >= chunk_end) {
+            return;
           }
-          if (w.address_first <= cursor) {
-            skip_to = std::max(skip_to, std::min(end, w.address_last + 1));
+          if (first <= cursor) {
+            skip_to = std::max(skip_to, std::min(end, last + 1));
           } else {
-            chunk_end = w.address_first;
+            chunk_end = first;
+          }
+        };
+        for (const OnDemandCpuWrite& w : batch.cpu_writes) {
+          if (w.seq > seq) {
+            clip(w.address_first, w.address_last);
           }
         }
+
         if (skip_to > cursor) {
           cursor = skip_to;
           continue;
@@ -3232,6 +3327,11 @@ void D3D12CommandProcessor::RetireOnDemandMemexport(bool wait) {
     OnDemandReadbackBuffer buffer = batch.buffer;
     on_demand_pending_.pop_front();
     on_demand_free_.push_back(buffer);
+  }
+  if (!retired.empty()) {
+    MX_PROBE("retire wait={} thread={} retired_batches={} left={} unpublished_left={}", wait,
+             ::GetCurrentThreadId(), mx_pending_before - on_demand_pending_.size(),
+             on_demand_pending_.size(), on_demand_unpublished_);
   }
   if (retired.empty()) {
     return;
@@ -3295,6 +3395,8 @@ bool D3D12CommandProcessor::ProvideOnDemandMemexportThunk(
     std::unique_lock<std::recursive_mutex>& global_lock_locked_once, void* context,
     uint32_t physical_address) {
   auto* self = static_cast<D3D12CommandProcessor*>(context);
+  MX_PROBE("fault addr={:08X} thread={} unpublished={}", physical_address,
+           ::GetCurrentThreadId(), self->on_demand_unpublished_);
   self->RetireOnDemandMemexport(true);
   // Whatever was still marked on this page has been delivered now.
   self->memory_->DisablePhysicalMemoryDataProviders(physical_address & ~uint32_t(0xFFF), 0x1000);
@@ -3358,9 +3460,13 @@ void D3D12CommandProcessor::MemexportCpuWriteWatchThunk(
     return;
   }
   if (self->on_demand_recording_.load(std::memory_order_acquire)) {
-    std::lock_guard<std::mutex> lock(self->memexport_cpu_writes_mutex_);
-    self->on_demand_cpu_writes_.push_back(
-        {address_first, address_last, self->on_demand_seq_.load(std::memory_order_acquire)});
+    {
+      std::lock_guard<std::mutex> lock(self->memexport_cpu_writes_mutex_);
+      self->on_demand_cpu_writes_.push_back(
+          {address_first, address_last, self->on_demand_seq_.load(std::memory_order_acquire)});
+    }
+    MX_PROBE("cpuwrite {:08X}-{:08X} recording thread={}", address_first, address_last,
+             ::GetCurrentThreadId());
   }
   uint32_t queued = self->memexport_batch_queued_.load(std::memory_order_acquire);
   if (!queued) {

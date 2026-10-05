@@ -16,6 +16,7 @@
 #include "platform_win.h"
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 
@@ -26,6 +27,10 @@
 #include <string>
 
 #include <fmt/format.h>
+
+REXCVAR_DEFINE_BOOL(crash_report_popup, true, "Log",
+                    "After a crash, offer to open a GitHub issue for it");
+REXCVAR_DECLARE(std::string, log_file);
 
 namespace rex::arch {
 
@@ -134,7 +139,8 @@ bool RunCrashReporterGuarded() {
 
 // dbghelp is loaded on demand so the runtime keeps no link-time dependency on
 // it; if it is missing, the log lines are still written.
-bool WriteDumpImpl(PEXCEPTION_POINTERS ex_info, const char* prefix) {
+bool WriteDumpImpl(PEXCEPTION_POINTERS ex_info, const char* prefix,
+                   char* written_path = nullptr) {
   using PFNMiniDumpWriteDump = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int,
                                              void*, void*, void*);
   HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
@@ -190,6 +196,9 @@ bool WriteDumpImpl(PEXCEPTION_POINTERS ex_info, const char* prefix) {
   CloseHandle(file);
   if (ok) {
     REXLOG_CRITICAL("[FATAL] Minidump written to {}", path);
+    if (written_path) {
+      strcpy_s(written_path, MAX_PATH, path);
+    }
   } else {
     DeleteFileA(path);
     REXLOG_CRITICAL("[FATAL] Minidump failed (error 0x{:08X}, fallback 0x{:08X})",
@@ -201,7 +210,74 @@ bool WriteDumpImpl(PEXCEPTION_POINTERS ex_info, const char* prefix) {
   return ok != FALSE;
 }
 
+// Players rarely know a crash left anything behind, so the log and the dump
+// never reach an issue. This starts a second copy of the executable with
+// --crash-report; the app handles that flag before anything else starts and
+// only shows a Yes/No box that leads to GitHub. A fresh process, because this
+// one is about to die and its window, heap and UI thread may be what broke.
+void LaunchCrashPopup(const char* dump_path) {
+  if (!REXCVAR_GET(crash_report_popup)) {
+    return;
+  }
+  wchar_t exe[MAX_PATH] = {};
+  if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
+    return;
+  }
+  auto widen = [](const std::string& text) {
+    std::wstring wide(text.size() + 1, L'\0');
+    const int n = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, wide.data(),
+                                      static_cast<int>(wide.size()));
+    wide.resize(n > 0 ? n - 1 : 0);
+    return wide;
+  };
+  wchar_t dump_full[MAX_PATH] = {};
+  if (dump_path && *dump_path) {
+    GetFullPathNameW(widen(dump_path).c_str(), MAX_PATH, dump_full, nullptr);
+  }
+  std::wstring log_path = widen(REXCVAR_GET(log_file));
+  std::wstring command_line = L"\"" + std::wstring(exe) + L"\" --crash-report";
+  command_line += L" --crash-dump \"" + std::wstring(dump_full) + L"\"";
+  command_line += L" --crash-log \"" + log_path + L"\"";
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  // Launchers (and some shells) run the game inside a job that kills every
+  // child when the game goes, which would take the box down with it. Break
+  // away from the job when it allows that; otherwise start it normally.
+  BOOL started = CreateProcessW(exe, command_line.data(), nullptr, nullptr, FALSE,
+                                CREATE_BREAKAWAY_FROM_JOB, nullptr, nullptr, &startup, &process);
+  if (!started) {
+    started = CreateProcessW(exe, command_line.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                             nullptr, &startup, &process);
+  }
+  if (started) {
+    // The box must be able to take the foreground from a dying process.
+    AllowSetForegroundWindow(process.dwProcessId);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    REXLOG_CRITICAL("[FATAL] Crash report popup started");
+  } else {
+    REXLOG_CRITICAL("[FATAL] Could not start the crash report popup (error {})",
+                    static_cast<uint32_t>(GetLastError()));
+  }
+  if (auto logger = ::rex::GetLogger()) {
+    logger->flush();
+  }
+}
+
 LONG WINAPI LastChanceExceptionFilter(PEXCEPTION_POINTERS ex_info) {
+  // One report per process. Another thread crashing meanwhile waits here
+  // (the process ends when the first report finishes); a fault inside this
+  // filter on the same thread just falls through.
+  static volatile LONG owner = 0;
+  const LONG self = static_cast<LONG>(GetCurrentThreadId());
+  const LONG previous = InterlockedCompareExchange(&owner, self, 0);
+  if (previous == self) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  if (previous != 0) {
+    Sleep(INFINITE);
+  }
   const EXCEPTION_RECORD* record = ex_info->ExceptionRecord;
   const uint64_t address = reinterpret_cast<uint64_t>(record->ExceptionAddress);
   REXLOG_CRITICAL("[FATAL] Unhandled exception 0x{:08X} at host 0x{:016X}",
@@ -248,7 +324,9 @@ LONG WINAPI LastChanceExceptionFilter(PEXCEPTION_POINTERS ex_info) {
     }
   }
 
-  WriteDumpImpl(ex_info, "crash");
+  char dump_path[MAX_PATH] = {};
+  WriteDumpImpl(ex_info, "crash", dump_path);
+  LaunchCrashPopup(dump_path);
   return EXCEPTION_CONTINUE_SEARCH;
 }
 

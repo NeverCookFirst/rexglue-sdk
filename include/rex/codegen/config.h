@@ -47,6 +47,9 @@ struct FunctionConfig {
   uint32_t end = 0;     // End address, exclusive (mutually exclusive with size)
   std::string name;     // Custom symbol name (empty = auto-generate sub_XXXXXXXX)
   uint32_t parent = 0;  // Parent function address (0 = standalone, non-zero = chunk)
+  // Keep this entry callable, but start at its exact address in the named
+  // owner's emitted body. Intended for explicit interior entry points.
+  uint32_t bodyOwner = 0;
 
   // Keep non-volatiles in ctx instead of localizing them. Marks an MSVC SEH
   // funclet, which reads the registers its owner left live and would see a zero

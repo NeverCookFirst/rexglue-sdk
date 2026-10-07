@@ -54,7 +54,7 @@ class FunctionGraph {
 
   // Add a function to the graph.
   // Returns the new node, or existing node if already present (higher authority wins).
-  // Notifies all PENDING functions to try resolution against the new entry.
+  // Notifies PENDING functions with unresolved jumps against the new entry.
   // hasXrefs: true if this is a known call target (bl target, etc.)
   FunctionNode* addFunction(uint32_t base, uint32_t size, FunctionAuthority authority,
                             bool hasXrefs = false);
@@ -199,7 +199,11 @@ class FunctionGraph {
   std::vector<std::pair<uint32_t, uint32_t>> chunks_;    // base, size pairs
   MemoryReader memoryReader_;
 
-  // Notify all PENDING functions that a new function was added
+  // Only these entries can benefit from registration notifications. Entry
+  // addresses remain valid across graph moves and never retain replaced nodes.
+  std::unordered_set<uint32_t> unresolvedFunctionEntries_;
+
+  // Notify indexed PENDING functions that a new function was added
   void notifyFunctionAdded(FunctionNode* newFunction);
 };
 

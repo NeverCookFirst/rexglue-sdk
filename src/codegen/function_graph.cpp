@@ -346,7 +346,81 @@ void emit_print(std::string& out, fmt::format_string<Args...> fmt, Args&&... arg
 
 }  // namespace
 
-std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+std::string FunctionNode::emitCpp(const EmitContext& ctx, const FunctionNode* entry) const {
+  if (!entry || entry == this)
+    return emitCppForEntry(ctx, *this);
+
+  // Emission-only copy: preserve graph identities and ordinary owner output.
+  // An interior entry can discover an extra path the owner's CFG missed.
+  FunctionNode body = *this;
+  body.blocks_.insert(body.blocks_.end(), entry->blocks_.begin(), entry->blocks_.end());
+  std::sort(body.blocks_.begin(), body.blocks_.end(),
+            [](const Block& a, const Block& b) { return a.base < b.base; });
+  std::vector<Block> merged;
+  for (const auto& block : body.blocks_) {
+    if (!merged.empty() && block.base <= merged.back().end()) {
+      merged.back().size = std::max(merged.back().end(), block.end()) - merged.back().base;
+    } else {
+      merged.push_back(block);
+    }
+  }
+  body.blocks_ = std::move(merged);
+  for (const auto& block : body.blocks_)
+    body.size_ = std::max(body.size_, block.end() - body.base_);
+  body.labels_.insert(entry->labels_.begin(), entry->labels_.end());
+  body.labels_.insert(entry->base());
+  // Prefer owner metadata at shared sites. Copy only additional call sites
+  // so an entry's independently classified backward branch cannot replace it.
+  auto hasCallSite = [&](uint32_t site) {
+    auto matches = [site](const CallEdge& call) { return call.site == site; };
+    return std::any_of(body.calls_.begin(), body.calls_.end(), matches) ||
+           std::any_of(body.tailCalls_.begin(), body.tailCalls_.end(), matches);
+  };
+  for (const auto& call : entry->calls_) {
+    if (!hasCallSite(call.site))
+      body.calls_.push_back(call);
+  }
+  for (const auto& call : entry->tailCalls_) {
+    if (!hasCallSite(call.site))
+      body.tailCalls_.push_back(call);
+  }
+  // The writer proves deferred local branches land on actual union bytes.
+  // CONFIG/PDATA containsAddress also trusts holes, so check block coverage
+  // directly. Preserve resolved external calls even if their address overlaps.
+  for (const auto* node : {this, entry}) {
+    for (const auto& jump : node->unresolvedJumps_) {
+      if (jump.isCall) continue;
+      const CallTarget* call = nullptr;
+      for (const auto* edges : {&body.calls_, &body.tailCalls_}) {
+        for (const auto& edge : *edges) {
+          if (edge.site == jump.site) { call = &edge.target; break; }
+        }
+        if (call) break;
+      }
+      if (call && ((call->isFunction() && call->asFunction() &&
+                    call->asFunction()->base() == jump.target) ||
+          (call->isImport() &&
+           std::get<CallTarget::ToImport>(call->value).address == jump.target)))
+        continue;
+      if (std::any_of(body.blocks_.begin(), body.blocks_.end(), [&](const Block& block) {
+            return jump.target >= block.base &&
+                   uint64_t(jump.target) + 4 <= uint64_t(block.base) + block.size;
+          }))
+        body.labels_.insert(jump.target);
+    }
+  }
+  for (const auto& table : entry->jumpTables_) {
+    if (std::none_of(body.jumpTables_.begin(), body.jumpTables_.end(),
+                     [&](const JumpTable& existing) {
+                       return existing.bctrAddress == table.bctrAddress;
+                     }))
+      body.jumpTables_.push_back(table);
+  }
+  return body.emitCppForEntry(ctx, *entry);
+}
+
+std::string FunctionNode::emitCppForEntry(const EmitContext& ctx,
+                                         const FunctionNode& entry) const {
   if (authority() == FunctionAuthority::IMPORT) {
     return "";
   }
@@ -385,6 +459,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   // --- First pass: collect labels from all blocks ---
   std::unordered_set<size_t> labels;
   labels.reserve(64);
+  if (entry.base() != base())
+    labels.insert(entry.base());
 
   for (const auto& block : blocks()) {
     auto* blockData = reinterpret_cast<const uint32_t*>(ctx.binary.translate(block.base));
@@ -470,12 +546,12 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
 
   // --- Function name ---
   std::string name;
-  if (base() == ctx.entryPoint) {
+  if (entry.base() == ctx.entryPoint) {
     name = "xstart";
-  } else if (!name_.empty()) {
-    name = name_;
+  } else if (!entry.name_.empty()) {
+    name = entry.name_;
   } else {
-    name = fmt::format("sub_{:08X}", base());
+    name = fmt::format("sub_{:08X}", entry.base());
   }
 
   // Function signature with weak/alias pattern
@@ -493,6 +569,10 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
 
   std::string body;
   body.reserve(4096);
+  // Local declarations are emitted before body below, so this jump skips
+  // guest prologue instructions without crossing C++ initialization.
+  if (entry.base() != base())
+    emit_println(body, "\tgoto loc_{:X};", entry.base());
 
   ppc_insn insn;
   std::unordered_set<size_t> emittedLabels;
@@ -756,13 +836,14 @@ FunctionNode* FunctionGraph::addFunction(uint32_t base, uint32_t size, FunctionA
   // Create new node
   auto node = std::make_unique<FunctionNode>(base, size, authority);
   FunctionNode* nodePtr = node.get();
+  unresolvedFunctionEntries_.erase(base);
   functions_[base] = std::move(node);
   functionsByBase_[base] = nodePtr;
 
   // Track xrefs for merge eligibility
   functionHasXrefs_[base] = hasXrefs;
 
-  // Notify all PENDING functions
+  // Notify PENDING functions that still have unresolved jumps
   notifyFunctionAdded(nodePtr);
 
   return nodePtr;
@@ -800,6 +881,7 @@ bool FunctionGraph::removeFunction(uint32_t entryPoint) {
     return false;
   }
   REXCODEGEN_TRACE("FunctionGraph: removing absorbed function 0x{:08X}", entryPoint);
+  unresolvedFunctionEntries_.erase(entryPoint);
   functionsByBase_.erase(entryPoint);
   functions_.erase(it);
   functionHasXrefs_.erase(entryPoint);  // Clean up xref tracking
@@ -962,6 +1044,11 @@ void FunctionGraph::addUnresolvedJumpToFunction(uint32_t entry, uint32_t site, u
   }
 
   // Not resolvable yet - add as unresolved
+  if (node->isPending()) {
+    // Index before appending: an allocation failure must not leave a live jump
+    // hidden from notifications. An empty indexed owner is pruned safely.
+    unresolvedFunctionEntries_.insert(entry);
+  }
   node->addUnresolvedJump(site, target, isCall, conditional);
   REXCODEGEN_TRACE("FunctionGraph: added unresolved {} 0x{:08X}->0x{:08X} to function 0x{:08X}",
                    isCall ? "call" : "jump", site, target, entry);
@@ -973,8 +1060,10 @@ void FunctionGraph::addUnresolvedJumpToFunction(uint32_t entry, uint32_t site, u
 
 size_t FunctionGraph::tryResolveFunction(uint32_t entry) {
   auto* node = getFunction(entry);
-  if (!node || node->isSealed())
+  if (!node || node->isSealed()) {
+    unresolvedFunctionEntries_.erase(entry);
     return 0;
+  }
 
   size_t resolved = 0;
 
@@ -1026,6 +1115,9 @@ size_t FunctionGraph::tryResolveFunction(uint32_t entry) {
     REXCODEGEN_TRACE("  0x{:08X}->0x{:08X}: still unresolved", jump.site, jump.target);
   }
 
+  if (!node->hasUnresolvedJumps()) {
+    unresolvedFunctionEntries_.erase(entry);
+  }
   return resolved;
 }
 
@@ -1043,6 +1135,7 @@ bool FunctionGraph::trySealFunction(uint32_t entry) {
 
   if (node->canSeal()) {
     node->seal();
+    unresolvedFunctionEntries_.erase(entry);
     return true;
   }
   return false;
@@ -1055,6 +1148,7 @@ size_t FunctionGraph::sealAllReady() {
     if (node->isPending()) {
       if (node->canSeal()) {
         node->seal();
+        unresolvedFunctionEntries_.erase(base);
         sealed++;
       } else {
         couldNotSeal++;
@@ -1094,6 +1188,7 @@ void FunctionGraph::sealAll() {
     }
 
     node->seal();
+    unresolvedFunctionEntries_.erase(base);
   }
 
   if (!errors.empty()) {
@@ -1284,9 +1379,21 @@ TargetKind FunctionGraph::classifyTarget(uint32_t target, uint32_t callerAddr,
 }
 
 void FunctionGraph::notifyFunctionAdded(FunctionNode* newFunction) {
-  for (auto& [base, node] : functions_) {
-    if (node.get() != newFunction && node->isPending()) {
+  for (auto it = unresolvedFunctionEntries_.begin(); it != unresolvedFunctionEntries_.end();) {
+    auto* node = getFunction(*it);
+    // Public node sealing can bypass the graph helpers (imports may seal even
+    // with unresolved jumps). Prune those entries before attempting resolution.
+    if (!node || !node->isPending() || !node->hasUnresolvedJumps()) {
+      it = unresolvedFunctionEntries_.erase(it);
+      continue;
+    }
+    if (node != newFunction) {
       node->tryResolveAgainst(newFunction);
+    }
+    if (!node->hasUnresolvedJumps()) {
+      it = unresolvedFunctionEntries_.erase(it);
+    } else {
+      ++it;
     }
   }
 }

@@ -35,6 +35,120 @@
 
 namespace {
 
+bool ValidateFunctionBodies(const rex::codegen::RecompilerConfig& config,
+                            const rex::codegen::FunctionGraph& graph,
+                            const rex::codegen::BinaryView& binary) {
+  for (const auto& [address, function] : config.functions) {
+    if (!function.bodyOwner)
+      continue;
+    auto reject = [&](std::string_view reason) {
+      REXCODEGEN_ERROR("Function 0x{:08X} body 0x{:08X}: {}", address,
+                       function.bodyOwner, reason);
+      return false;
+    };
+    if ((address & 3) || (function.bodyOwner & 3) || function.parent ||
+        address == function.bodyOwner)
+      return reject("body requires a distinct aligned owner and cannot be a chunk");
+    if (config.ctrAsLocalVariable || config.xerAsLocalVariable ||
+        config.reservedRegisterAsLocalVariable || config.crRegistersAsLocalVariables ||
+        config.nonArgumentRegistersAsLocalVariables || config.nonVolatileRegistersAsLocalVariables)
+      return reject("interior body entries require all register localization options disabled");
+    auto ownerConfig = config.functions.find(function.bodyOwner);
+    if (ownerConfig != config.functions.end() && ownerConfig->second.bodyOwner)
+      return reject("nested or cyclic body owners are unsupported");
+    const auto* entry = graph.getFunction(address);
+    const auto* owner = graph.getFunction(function.bodyOwner);
+    if (!entry || !owner || entry->isRegistered() || owner->isRegistered() ||
+        entry->isImport() || owner->isImport() || owner->blocks().empty() ||
+        entry->blocks().empty()) {
+      REXCODEGEN_ERROR("Body node states: entry present={} state={} import={} unresolved={}; owner present={} state={} import={} unresolved={}",
+          entry != nullptr, entry ? int(entry->state()) : -1, entry && entry->isImport(),
+          entry ? entry->unresolvedJumps().size() : 0, owner != nullptr,
+          owner ? int(owner->state()) : -1, owner && owner->isImport(),
+          owner ? owner->unresolvedJumps().size() : 0);
+      return reject("entry and owner must have discovered non-import instruction blocks");
+    }
+    if (std::any_of(config.rexcrtFunctions.begin(), config.rexcrtFunctions.end(),
+                    [&](const auto& crt) {
+                      return crt.second == address || crt.second == function.bodyOwner;
+                    }))
+      return reject("body entries cannot replace a rexcrt mapping");
+    bool contained = std::any_of(owner->blocks().begin(), owner->blocks().end(),
+                                  [&](const rex::codegen::Block& block) {
+      return address >= block.base && uint64_t(address) + 4 <= uint64_t(block.base) + block.size;
+    });
+    if (!contained || !binary.translate(address))
+      return reject("entry instruction is missing from the owner's actual blocks");
+    // The emission union must never wrap an address or import unmapped bytes.
+    for (const auto* node : {owner, entry}) {
+      for (const auto& block : node->blocks()) {
+        const auto* section = binary.findSection(block.base);
+        if (!block.size || (block.base & 3) || (block.size & 3) ||
+            block.base < owner->base() || !section || !section->executable ||
+            uint64_t(block.base) + block.size > UINT32_MAX ||
+            uint64_t(block.base) + block.size > uint64_t(section->baseAddress) + section->size)
+          return reject("body has an invalid or unmapped instruction block");
+      }
+    }
+    auto inBody = [&](uint32_t instruction) {
+      if (instruction & 3) return false;
+      for (const auto* node : {owner, entry}) {
+        for (const auto& block : node->blocks()) {
+          if (instruction >= block.base &&
+              uint64_t(instruction) + 4 <= uint64_t(block.base) + block.size)
+            return true;
+        }
+      }
+      return false;
+    };
+    auto resolvedAt = [&](uint32_t site) -> const rex::codegen::CallTarget* {
+      // Match the emission union's owner-first precedence exactly.
+      for (const auto* node : {owner, entry}) {
+        for (const auto* edges : {&node->calls(), &node->tailCalls()}) {
+          for (const auto& edge : *edges)
+            if (edge.site == site) return &edge.target;
+        }
+      }
+      return nullptr;
+    };
+    for (const auto* node : {owner, entry}) {
+      for (const auto& jump : node->unresolvedJumps()) {
+        if (!inBody(jump.site)) return reject("pending branch site is outside the actual body");
+        const auto* bytes = binary.translate(jump.site);
+        uint32_t instruction = (uint32_t(bytes[0]) << 24) | (uint32_t(bytes[1]) << 16) |
+                               (uint32_t(bytes[2]) << 8) | bytes[3];
+        uint32_t opcode = instruction >> 26;
+        if ((opcode != 16 && opcode != 18) || bool(instruction & 1) != jump.isCall ||
+            (opcode == 16) != jump.isConditional)
+          return reject("pending branch metadata does not match its instruction");
+        unsigned width = opcode == 16 ? 16 : 26;
+        uint32_t displacementBits = instruction & ((uint32_t(1) << width) - 4);
+        int64_t displacement = displacementBits;
+        if (displacementBits & (uint32_t(1) << (width - 1)))
+          displacement -= int64_t(1) << width;
+        uint32_t target = static_cast<uint32_t>(displacement +
+            ((instruction & 2) ? 0 : int64_t(jump.site)));
+        if (target != jump.target) return reject("pending branch target does not match its instruction");
+        const auto* call = resolvedAt(jump.site);
+        bool mapped = call && ((call->isFunction() && call->asFunction() &&
+                               call->asFunction()->base() == target) ||
+            (call->isImport() &&
+             std::get<rex::codegen::CallTarget::ToImport>(call->value).address == target));
+        if (mapped) continue;
+        if (jump.isCall || !inBody(target))
+          return reject("pending branch has no actual local instruction or resolved call target");
+        // Conditional local branches use owner labels. An unconditional jump
+        // to a graph entry still requires call metadata with the current builder.
+        auto kind = graph.classifyTarget(target, jump.site, false);
+        if (!jump.isConditional && (kind == rex::codegen::TargetKind::Function ||
+                                   kind == rex::codegen::TargetKind::Import))
+          return reject("pending unconditional branch conflicts with another graph entry");
+      }
+    }
+  }
+  return true;
+}
+
 nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
                                  const std::vector<const rex::codegen::FunctionNode*>& functions,
                                  const std::unordered_map<uint32_t, std::string>& rexcrtByAddr) {
@@ -173,6 +287,8 @@ bool CodegenWriter::write(bool force) {
                      ctx_.errors.Count());
     return false;
   }
+  if (!ValidateFunctionBodies(config(), graph(), binary()))
+    return false;
 
   // --- Output directory setup (from recompile.cpp) ---
   std::filesystem::path outputPath = ctx_.configDir() / config().outDirectoryPath;
@@ -264,7 +380,10 @@ bool CodegenWriter::write(bool force) {
   emitCtx.referenced = &referenced;
   for (const auto* fn : functions) {
     referenced.clear();
-    std::string code = fn->emitCpp(emitCtx);
+    const auto configured = config().functions.find(fn->base());
+    const auto* body = configured != config().functions.end() && configured->second.bodyOwner
+        ? graph().getFunction(configured->second.bodyOwner) : fn;
+    std::string code = body->emitCpp(emitCtx, body == fn ? nullptr : fn);
     if (code.size() > maxFileBytes) {
       REXCODEGEN_WARN("Function 0x{:08X} is {} bytes, exceeds max_file_size_bytes ({})", fn->base(),
                       code.size(), maxFileBytes);

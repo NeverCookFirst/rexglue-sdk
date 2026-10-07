@@ -11,6 +11,10 @@
 
 #include "ppc/instruction.h"
 
+#include <algorithm>
+#include <functional>
+#include <map>
+#include <queue>
 #include <unordered_set>
 
 #include <rex/codegen/phases.h>
@@ -178,28 +182,55 @@ void gapFillCodeRegions(CodegenContext& ctx) {
 
 void cleanupAbsorbedGapFills(CodegenContext& ctx) {
   auto& graph = ctx.graph;
-  std::vector<uint32_t> toRemove;
-
+  std::vector<const FunctionNode*> ordered;
+  ordered.reserve(graph.functions().size());
   for (const auto& [addr, node] : graph.functions()) {
-    if (node->authority() != FunctionAuthority::GAP_FILL)
-      continue;
+    ordered.push_back(node.get());
+  }
+  std::sort(ordered.begin(), ordered.end(), [](const auto* a, const auto* b) {
+    return a->base() < b->base();
+  });
 
-    for (const auto& [otherAddr, otherNode] : graph.functions()) {
-      if (otherAddr == addr)
-        continue;
-      if (!otherNode->containsAddress(addr))
-        continue;
+  // containsAddress first rejects points outside [base, base + size). Only
+  // lower-base owners whose overall end remains above this entry can absorb it.
+  // Keep the real block/authority predicate for holes and declared-size owners.
+  using EndEntry = std::pair<uint32_t, uint32_t>;
+  std::priority_queue<EndEntry, std::vector<EndEntry>, std::greater<EndEntry>> endings;
+  std::map<uint32_t, const FunctionNode*> active;
+  std::unordered_set<uint32_t> absorbed;
+  for (const auto* node : ordered) {
+    const uint32_t addr = node->base();
+    while (!endings.empty() && endings.top().first <= addr) {
+      active.erase(endings.top().second);
+      endings.pop();
+    }
 
-      // This GAP_FILL is inside another function's blocks
-      if (otherNode->authority() != FunctionAuthority::GAP_FILL) {
-        // Absorbed by higher authority - remove
-        toRemove.push_back(addr);
-        break;
-      } else if (otherAddr < addr) {
-        // Both GAP_FILL, other has lower address - it survives
-        toRemove.push_back(addr);
-        break;
+    if (node->authority() == FunctionAuthority::GAP_FILL) {
+      for (const auto& [otherAddr, otherNode] : active) {
+        if (!otherNode->containsAddress(addr))
+          continue;
+        if (otherNode->authority() != FunctionAuthority::GAP_FILL || otherAddr < addr) {
+          absorbed.insert(addr);
+          break;
+        }
       }
+    }
+
+    // Match uint32_t wrap behavior: wrapped/empty bounds contain no address.
+    // Even an absorbed owner remains visible until the final batch removal.
+    const uint32_t end = node->end();
+    if (end > addr) {
+      active.emplace(addr, node);
+      endings.emplace(end, addr);
+    }
+  }
+
+  // Preserve the original removal order, independent of the sorted sweep.
+  std::vector<uint32_t> toRemove;
+  toRemove.reserve(absorbed.size());
+  for (const auto& [addr, node] : graph.functions()) {
+    if (absorbed.contains(addr)) {
+      toRemove.push_back(addr);
     }
   }
 

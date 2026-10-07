@@ -84,8 +84,8 @@ class CommandProcessor {
   CommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state);
   virtual ~CommandProcessor();
 
-  uint32_t counter() const { return counter_; }
-  void increment_counter() { counter_++; }
+  uint32_t counter() const { return counter_.load(std::memory_order_relaxed); }
+  void increment_counter() { counter_.fetch_add(1, std::memory_order_relaxed); }
 
   // What the GPU thread is doing right now, for hang reports. Any thread.
   std::string DescribeState() const;
@@ -259,7 +259,8 @@ class CommandProcessor {
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;
 
-  uint32_t counter_ = 0;
+  // Both the vblank worker and command processor increment this counter.
+  std::atomic<uint32_t> counter_{0};
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;

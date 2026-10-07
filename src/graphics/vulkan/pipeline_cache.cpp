@@ -414,6 +414,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   // Initialize the pipeline storage stream - read pipeline descriptions and
   // collect used shader modifications to translate.
   std::vector<PipelineStoredDescription> pipeline_stored_descriptions;
+  size_t pipeline_storage_valid_count = 0;
   // <Shader hash, modification bits>.
   std::set<std::pair<uint64_t, uint64_t>> shader_translations_needed;
   auto pipeline_storage_file_path =
@@ -473,6 +474,10 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
           pipeline_storage_read_count = i;
           break;
         }
+        // Unsupported pipelines are omitted from startup creation, but their
+        // valid disk records remain useful on another device. The in-memory
+        // compaction below does not rewrite the storage stream.
+        pipeline_storage_valid_count = i + 1;
         if (!ArePipelineRequirementsMet(pipeline_stored_description.description)) {
           ++pipeline_storage_skipped_unsupported_count;
           continue;
@@ -525,16 +530,36 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
       shader_storage_file_header.magic == shader_storage_magic &&
       rex::byte_swap(shader_storage_file_header.version_swapped) == ShaderStoredHeader::kVersion) {
     uint64_t shader_storage_valid_bytes = sizeof(shader_storage_file_header);
+    const bool shader_storage_end_seeked =
+        rex::filesystem::Seek(shader_storage_file_, 0, SEEK_END);
+    const int64_t shader_storage_file_end =
+        shader_storage_end_seeked ? rex::filesystem::Tell(shader_storage_file_) : -1;
+    const bool shader_storage_size_valid =
+        shader_storage_file_end >= int64_t(shader_storage_valid_bytes) &&
+        rex::filesystem::Seek(shader_storage_file_, int64_t(shader_storage_valid_bytes), SEEK_SET);
+    if (!shader_storage_size_valid) {
+      REXGPU_WARN("Shader storage: unable to determine readable file size; skipping cache load");
+    }
     // Load shaders written by previous runs until the end of the file or until
     // a corrupted one is detected.
     ShaderStoredHeader shader_header;
     std::vector<uint32_t> ucode_dwords;
     ucode_dwords.reserve(0xFFFF);
-    while (true) {
+    while (shader_storage_size_valid) {
       if (!fread(&shader_header, sizeof(shader_header), 1, shader_storage_file_)) {
         break;
       }
       size_t ucode_byte_count = shader_header.ucode_dword_count * sizeof(uint32_t);
+      const uint64_t payload_offset = shader_storage_valid_bytes + sizeof(shader_header);
+      // A corrupt 31-bit count must not allocate gigabytes before fread can
+      // discover the truncated payload. Validate against this open file first.
+      if (payload_offset > uint64_t(shader_storage_file_end) ||
+          shader_header.ucode_dword_count >
+              (uint64_t(shader_storage_file_end) - payload_offset) / sizeof(uint32_t)) {
+        REXGPU_WARN("Shader storage: truncated payload at byte {}; discarding corrupt suffix",
+                    shader_storage_valid_bytes);
+        break;
+      }
       ucode_dwords.resize(shader_header.ucode_dword_count);
       if (shader_header.ucode_dword_count &&
           !fread(ucode_dwords.data(), ucode_byte_count, 1, shader_storage_file_)) {
@@ -555,7 +580,9 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
       // Loaded from the current storage - don't write again.
       shader->set_ucode_storage_index(shader_storage_index_);
     }
-    rex::filesystem::TruncateStdioFile(shader_storage_file_, shader_storage_valid_bytes);
+    if (shader_storage_size_valid) {
+      rex::filesystem::TruncateStdioFile(shader_storage_file_, shader_storage_valid_bytes);
+    }
   } else {
     rex::filesystem::TruncateStdioFile(shader_storage_file_, 0);
     shader_storage_file_header.magic = shader_storage_magic;
@@ -687,13 +714,13 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     }
   }
 
-  // If any pipeline descriptions were corrupted (or the whole file has excess
-  // bytes in the end), truncate to the last valid pipeline description.
+  // Truncate only the corrupt or incomplete suffix. Using the compacted
+  // supported count would discard valid records without rewriting their order.
   rex::filesystem::TruncateStdioFile(
       pipeline_storage_file_,
       uint64_t(sizeof(pipeline_storage_file_header) +
-               sizeof(PipelineStoredDescription) * pipeline_stored_descriptions.size()));
-  if (pipeline_stored_descriptions.empty()) {
+               sizeof(PipelineStoredDescription) * pipeline_storage_valid_count));
+  if (!pipeline_storage_valid_count) {
     rex::filesystem::TruncateStdioFile(pipeline_storage_file_, 0);
     pipeline_storage_file_header.magic = pipeline_storage_magic;
     pipeline_storage_file_header.magic_api = pipeline_storage_magic_api;

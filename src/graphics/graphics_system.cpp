@@ -197,15 +197,17 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
 }
 
 void GraphicsSystem::Shutdown() {
-  if (command_processor_) {
-    command_processor_->Shutdown();
-    command_processor_.reset();
-  }
-
+  // MarkVblank and its guest interrupt callback may still use the command
+  // processor. Keep it running until the vblank worker has finished.
   if (vsync_worker_thread_) {
     vsync_worker_running_ = false;
     vsync_worker_thread_->Wait(0, 0, 0, nullptr);
     vsync_worker_thread_.reset();
+  }
+
+  if (command_processor_) {
+    command_processor_->Shutdown();
+    command_processor_.reset();
   }
 
   if (presenter_) {
@@ -307,13 +309,16 @@ void GraphicsSystem::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_siz
 }
 
 void GraphicsSystem::SetInterruptCallback(uint32_t callback, uint32_t user_data) {
-  interrupt_callback_ = callback;
-  interrupt_callback_data_ = user_data;
+  interrupt_callback_state_.store((uint64_t(callback) << 32) | user_data,
+                                  std::memory_order_release);
   REXGPU_INFO("SetInterruptCallback({:08X}, {:08X})", callback, user_data);
 }
 
 void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
-  if (!interrupt_callback_) {
+  const uint64_t callback_state = interrupt_callback_state_.load(std::memory_order_acquire);
+  const uint32_t callback = uint32_t(callback_state >> 32);
+  const uint32_t callback_data = uint32_t(callback_state);
+  if (!callback) {
     return;
   }
 
@@ -327,10 +332,10 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   thread->SetActiveCpu(cpu);
 
   // REXGPU_INFO("Dispatching GPU interrupt at {:08X} w/ mode {} on cpu {}",
-  //          interrupt_callback_, source, cpu);
+  //          callback, source, cpu);
 
-  uint64_t args[] = {source, interrupt_callback_data_};
-  function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
+  uint64_t args[] = {source, callback_data};
+  function_dispatcher_->ExecuteInterrupt(thread->thread_state(), callback, args,
                                          rex::countof(args));
 }
 
@@ -401,14 +406,17 @@ void GraphicsSystem::Resume() {
 }
 
 bool GraphicsSystem::Save(::rex::stream::ByteStream* stream) {
-  stream->Write<uint32_t>(interrupt_callback_);
-  stream->Write<uint32_t>(interrupt_callback_data_);
+  const uint64_t callback_state = interrupt_callback_state_.load(std::memory_order_acquire);
+  stream->Write<uint32_t>(uint32_t(callback_state >> 32));
+  stream->Write<uint32_t>(uint32_t(callback_state));
   return command_processor_->Save(stream);
 }
 
 bool GraphicsSystem::Restore(::rex::stream::ByteStream* stream) {
-  interrupt_callback_ = stream->Read<uint32_t>();
-  interrupt_callback_data_ = stream->Read<uint32_t>();
+  const uint32_t callback = stream->Read<uint32_t>();
+  const uint32_t callback_data = stream->Read<uint32_t>();
+  interrupt_callback_state_.store((uint64_t(callback) << 32) | callback_data,
+                                  std::memory_order_release);
   return command_processor_->Restore(stream);
 }
 

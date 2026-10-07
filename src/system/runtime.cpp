@@ -272,10 +272,6 @@ void Runtime::Shutdown() {
     return;
   }
 
-  if (instance_ == this) {
-    instance_ = nullptr;
-  }
-
   if (graphics_system_) {
     graphics_system_->Shutdown();
     graphics_system_.reset();
@@ -289,6 +285,12 @@ void Runtime::Shutdown() {
     input_system_.reset();
   }
   kernel_state_.reset();
+  // Joined GPU/audio/kernel workers may make final indirect guest calls during
+  // shutdown. Keep their dispatcher reachable until those workers have stopped,
+  // then unpublish before destroying the dispatcher and its backing memory.
+  if (instance_ == this) {
+    instance_ = nullptr;
+  }
   function_dispatcher_.reset();
   export_resolver_.reset();
   file_system_.reset();

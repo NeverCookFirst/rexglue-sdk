@@ -356,6 +356,16 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       shader_storage_file_header.magic == shader_storage_magic &&
       rex::byte_swap(shader_storage_file_header.version_swapped) == ShaderStoredHeader::kVersion) {
     uint64_t shader_storage_valid_bytes = sizeof(shader_storage_file_header);
+    const bool shader_storage_end_seeked =
+        rex::filesystem::Seek(shader_storage_file_, 0, SEEK_END);
+    const int64_t shader_storage_file_end =
+        shader_storage_end_seeked ? rex::filesystem::Tell(shader_storage_file_) : -1;
+    const bool shader_storage_size_valid =
+        shader_storage_file_end >= int64_t(shader_storage_valid_bytes) &&
+        rex::filesystem::Seek(shader_storage_file_, int64_t(shader_storage_valid_bytes), SEEK_SET);
+    if (!shader_storage_size_valid) {
+      REXGPU_WARN("Shader storage: unable to determine readable file size; skipping cache load");
+    }
     // Load and translate shaders written by previous Xenia executions until the
     // end of the file or until a corrupted one is detected.
     ShaderStoredHeader shader_header;
@@ -447,11 +457,21 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     };
     std::vector<std::unique_ptr<rex::thread::Thread>> shader_translation_threads;
 
-    while (true) {
+    while (shader_storage_size_valid) {
       if (!fread(&shader_header, sizeof(shader_header), 1, shader_storage_file_)) {
         break;
       }
       size_t ucode_byte_count = shader_header.ucode_dword_count * sizeof(uint32_t);
+      const uint64_t payload_offset = shader_storage_valid_bytes + sizeof(shader_header);
+      // A corrupt 31-bit count must not allocate gigabytes before fread can
+      // discover the truncated payload. Validate against this open file first.
+      if (payload_offset > uint64_t(shader_storage_file_end) ||
+          shader_header.ucode_dword_count >
+              (uint64_t(shader_storage_file_end) - payload_offset) / sizeof(uint32_t)) {
+        REXGPU_WARN("Shader storage: truncated payload at byte {}; discarding corrupt suffix",
+                    shader_storage_valid_bytes);
+        break;
+      }
       ucode_dwords.resize(shader_header.ucode_dword_count);
       if (shader_header.ucode_dword_count &&
           !fread(ucode_dwords.data(), ucode_byte_count, 1, shader_storage_file_)) {
@@ -520,7 +540,9 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     REXGPU_INFO("Translated {} shaders from the storage in {} milliseconds", shaders_translated,
                 (rex::chrono::Clock::QueryHostTickCount() - shader_storage_initialization_start) *
                     1000 / rex::chrono::Clock::QueryHostTickFrequency());
-    rex::filesystem::TruncateStdioFile(shader_storage_file_, shader_storage_valid_bytes);
+    if (shader_storage_size_valid) {
+      rex::filesystem::TruncateStdioFile(shader_storage_file_, shader_storage_valid_bytes);
+    }
   } else {
     rex::filesystem::TruncateStdioFile(shader_storage_file_, 0);
     shader_storage_file_header.magic = shader_storage_magic;

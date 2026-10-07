@@ -536,6 +536,9 @@ void ReXApp::LaunchModule() {
     }
 
     OnPreLaunchModule();
+    if (app_context().HasQuitFromUIThread()) {
+      return;
+    }
 
     auto main_thread = runtime_->PrepareModuleLaunch();
     if (!main_thread) {

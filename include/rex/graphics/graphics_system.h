@@ -118,8 +118,9 @@ class GraphicsSystem : public system::IGraphicsSystem {
   std::unique_ptr<::rex::ui::GraphicsProvider> provider_;
   bool provider_supports_presentation_ = false;
 
-  uint32_t interrupt_callback_ = 0;
-  uint32_t interrupt_callback_data_ = 0;
+  // Publish callback address and its user data together. Interrupts may run on
+  // the vblank/GPU workers while the guest replaces this pair.
+  std::atomic<uint64_t> interrupt_callback_state_{0};
 
   std::atomic<bool> vsync_worker_running_;
   system::object_ref<system::XHostThread> vsync_worker_thread_;

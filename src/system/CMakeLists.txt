@@ -71,6 +71,9 @@ rex_target_pch(rexruntime
 target_include_directories(rexruntime PUBLIC
     $<BUILD_INTERFACE:${REXGLUE_ROOT}/include>
     $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
+    # Public UI headers expose ImGui types. Propagate its headers while keeping
+    # the ImGui OBJECT library linked privately into this single runtime DLL.
+    $<BUILD_INTERFACE:${REXGLUE_ROOT}/thirdparty/imgui>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_include_directories(rexruntime PRIVATE

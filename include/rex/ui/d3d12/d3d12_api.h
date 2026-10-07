@@ -19,7 +19,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <ObjBase.h>
+#include <objbase.h>
 
 #include <DXProgrammableCapture.h>
 #include <d3d12.h>

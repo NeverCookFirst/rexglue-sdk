@@ -157,6 +157,7 @@ target_compile_options(o1heap PRIVATE -w)
 # xxHash - extremely fast non-cryptographic hash (git submodule)
 set(XXHASH_BUILD_XXHSUM OFF CACHE BOOL "" FORCE)
 add_subdirectory(xxHash/cmake_unofficial)
+add_library(rex::xxhash ALIAS xxhash)
 target_compile_options(xxhash PRIVATE -w)
 
 # disasm - PowerPC disassembler (existing local library)

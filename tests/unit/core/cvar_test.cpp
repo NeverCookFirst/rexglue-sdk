@@ -12,6 +12,7 @@
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <toml++/toml.hpp>
 
 #include <rex/cvar.h>
 
@@ -513,7 +514,8 @@ TEST_CASE("cvar TOML serialization", "[cvar]") {
 
   // Should contain modified flags
   CHECK(toml.find("test_int32_flag = 999") != std::string::npos);
-  CHECK(toml.find("test_string_flag = \"custom\"") != std::string::npos);
+  const auto parsed = ::toml::parse(toml);
+  CHECK(parsed["test_string_flag"].value<std::string>() == "custom");
 
   // Should not contain flags at default
   CHECK(toml.find("test_bool_flag") == std::string::npos);
@@ -695,7 +697,8 @@ TEST_CASE("cvar SaveConfig", "[cvar]") {
     }
 
     CHECK(content.find("test_int32_flag = 777") != std::string::npos);
-    CHECK(content.find("test_string_flag = \"saved_value\"") != std::string::npos);
+    const auto parsed = ::toml::parse(content);
+    CHECK(parsed["test_string_flag"].value<std::string>() == "saved_value");
 
     std::filesystem::remove(save_path);
   }

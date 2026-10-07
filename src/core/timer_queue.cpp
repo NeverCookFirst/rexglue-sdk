@@ -10,7 +10,10 @@
  */
 
 #include <algorithm>
+#include <condition_variable>
+#include <cstdlib>
 #include <forward_list>
+#include <mutex>
 
 #include <disruptorplus/multi_threaded_claim_strategy.hpp>
 #include <disruptorplus/ring_buffer.hpp>
@@ -26,6 +29,121 @@ namespace dp = disruptorplus;
 namespace rex::thread {
 
 using WaitItem = TimerQueueWaitItem;
+
+// Snapshot the opt-in before starting this queue's thread. Blocking preserves
+// deadlines, but OS wakeup jitter can differ from the default phased spin wait.
+// Keep this private so timer and runtime ABI layouts do not change.
+class TimerWaitStrategy {
+ public:
+  // Closure is distinct from a timeout or a published sequence. In particular,
+  // waking a stopped consumer must never make an uninitialized ring slot valid.
+  struct Stopped {};
+
+  TimerWaitStrategy() : blocking_(std::getenv("REX_TIMER_WAIT_BLOCKING") != nullptr) {}
+
+  bool stopped() const { return stopped_.load(std::memory_order_acquire); }
+
+  void Stop() {
+    // Use the publication handshake for closure too, so stop cannot be lost
+    // between a blocking wait's predicate check and release of the mutex.
+    std::lock_guard lock(mutex_);
+    stopped_.store(true, std::memory_order_release);
+    cv_.notify_all();
+  }
+
+  dp::sequence_t wait_until_published(
+      dp::sequence_t sequence, size_t count,
+      const std::atomic<dp::sequence_t>* const sequences[]) {
+    if (!blocking_) {
+      ThrowIfStopped();
+      dp::spin_wait spinner;
+      auto result = dp::minimum_sequence_after(sequence, count, sequences);
+      while (dp::difference(result, sequence) < 0) {
+        ThrowIfStopped();
+        spinner.spin_once();
+        result = dp::minimum_sequence_after(sequence, count, sequences);
+      }
+      ThrowIfStopped();
+      return result;
+    }
+    dp::sequence_t result;
+    std::unique_lock lock(mutex_);
+    cv_.wait(lock, [&] {
+      result = dp::minimum_sequence_after(sequence, count, sequences);
+      return stopped() || dp::difference(result, sequence) >= 0;
+    });
+    ThrowIfStopped();
+    return result;
+  }
+
+  template <typename Rep, typename Period>
+  dp::sequence_t wait_until_published(
+      dp::sequence_t sequence, size_t count,
+      const std::atomic<dp::sequence_t>* const sequences[],
+      const std::chrono::duration<Rep, Period>& timeout) {
+    if (!blocking_) {
+      return wait_until_published(sequence, count, sequences,
+                                  std::chrono::high_resolution_clock::now() + timeout);
+    }
+    return wait_until_published(sequence, count, sequences,
+                                std::chrono::steady_clock::now() + timeout);
+  }
+
+  template <typename Clock, typename Duration>
+  dp::sequence_t wait_until_published(
+      dp::sequence_t sequence, size_t count,
+      const std::atomic<dp::sequence_t>* const sequences[],
+      const std::chrono::time_point<Clock, Duration>& deadline) {
+    if (!blocking_) {
+      ThrowIfStopped();
+      dp::spin_wait spinner;
+      auto result = dp::minimum_sequence_after(sequence, count, sequences);
+      while (dp::difference(result, sequence) < 0) {
+        ThrowIfStopped();
+        if (spinner.next_spin_will_yield() && deadline < Clock::now()) return result;
+        spinner.spin_once();
+        result = dp::minimum_sequence_after(sequence, count, sequences);
+      }
+      ThrowIfStopped();
+      return result;
+    }
+    dp::sequence_t result;
+    std::unique_lock lock(mutex_);
+    const auto ready = [&] {
+      result = dp::minimum_sequence_after(sequence, count, sequences);
+      return stopped() || dp::difference(result, sequence) >= 0;
+    };
+    // The empty queue has no deadline. Avoid converting time_point::max() to
+    // a platform timeout, which may overflow and turn an idle wait into a poll.
+    if (deadline == std::chrono::time_point<Clock, Duration>::max()) {
+      cv_.wait(lock, ready);
+    } else {
+      cv_.wait_until(lock, deadline, ready);
+    }
+    ThrowIfStopped();
+    return result;
+  }
+
+  void signal_all_when_blocking() {
+    if (!blocking_) {
+      return;
+    }
+    // Publishers store their sequence before entering this lock. Taking the
+    // same lock as the predicate prevents a lost wake between check and wait.
+    std::lock_guard lock(mutex_);
+    cv_.notify_all();
+  }
+
+ private:
+  void ThrowIfStopped() const {
+    if (stopped()) throw Stopped{};
+  }
+
+  const bool blocking_;
+  std::atomic<bool> stopped_{false};
+  std::mutex mutex_;
+  std::condition_variable cv_;
+};
 
 class TimerQueue {
  public:
@@ -45,12 +163,9 @@ class TimerQueue {
 
   ~TimerQueue() {
     dispatch_thread_.request_stop();
-
-    // Kick dispatch thread to check stop token
-    auto wait_item = std::make_shared<WaitItem>(nullptr, nullptr, this, clock::time_point::min(),
-                                                clock::duration::zero());
-    wait_item->Disarm();
-    QueueTimer(std::move(wait_item));
+    // Shutdown cannot depend on spare capacity in the producer ring. An active
+    // callback completes normally; an idle consumer leaves its publication wait.
+    wait_strategy_.Stop();
 
     // std::jthread auto-joins on destruction
   }
@@ -65,11 +180,20 @@ class TimerQueue {
     set_current_thread_name("rex::thread::TimerQueue");
 
     while (!stop_token.stop_requested()) {
+      // Callback ingress belongs only to this consumer. Defer it to the next
+      // iteration, rather than waiting for this same thread to free ring space.
+      deferred_wait_items_.sort(comp);
+      wait_queue_.merge(deferred_wait_items_, comp);
       {
         // Consume new wait items and add them to sorted wait queue
-        dp::sequence_t available = claim_strategy_.wait_until_published(
-            next_sequence, next_sequence - 1,
-            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
+        dp::sequence_t available;
+        try {
+          available = claim_strategy_.wait_until_published(
+              next_sequence, next_sequence - 1,
+              wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
+        } catch (const TimerWaitStrategy::Stopped&) {
+          break;
+        }
 
         // Check for timeout
         if (available != next_sequence - 1) {
@@ -124,12 +248,27 @@ class TimerQueue {
   }
 
   std::weak_ptr<WaitItem> QueueTimer(std::shared_ptr<WaitItem> wait_item) {
+    // The queue is permanently closed during teardown. Callers must still keep
+    // the queue alive for the whole call; closure does not extend its lifetime.
+    if (wait_strategy_.stopped()) return {};
     auto wait_item_weak = std::weak_ptr<WaitItem>(wait_item);
 
     // Mitigate callback flooding
     wait_item->due_ = std::max(clock::now() - wait_item->interval_, wait_item->due_);
 
-    auto sequence = claim_strategy_.claim_one();
+    if (std::this_thread::get_id() == dispatch_thread_id()) {
+      deferred_wait_items_.push_front(std::move(wait_item));
+      return wait_item_weak;
+    }
+
+    dp::sequence_t sequence;
+    try {
+      sequence = claim_strategy_.claim_one();
+    } catch (const TimerWaitStrategy::Stopped&) {
+      // A stopped claim is never published. The ring is permanently closed,
+      // so the reserved sequence cannot leave a hole in a running queue.
+      return {};
+    }
     buffer_[sequence] = std::move(wait_item);
     claim_strategy_.publish(sequence);
 
@@ -142,13 +281,14 @@ class TimerQueue {
   // This ring buffer will be used to introduce timers queued by the public API
   static constexpr size_t kWaitCount = 512;
   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
-  dp::spin_wait_strategy wait_strategy_;
-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
+  TimerWaitStrategy wait_strategy_;
+  dp::multi_threaded_claim_strategy<TimerWaitStrategy> claim_strategy_;
+  dp::sequence_barrier<TimerWaitStrategy> consumed_;
 
   // This is a _sorted_ (ascending due_) list of active timers managed by a
   // dedicated thread
   std::forward_list<std::shared_ptr<WaitItem>> wait_queue_;
+  std::forward_list<std::shared_ptr<WaitItem>> deferred_wait_items_;
   std::jthread dispatch_thread_;
 };
 

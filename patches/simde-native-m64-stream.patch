@@ -1,0 +1,21 @@
+diff --git a/simde/x86/sse.h b/simde/x86/sse.h
+index a8855f5..fac2f98 100644
+--- a/simde/x86/sse.h
++++ b/simde/x86/sse.h
+@@ -4757,7 +4757,15 @@ simde_mm_stream_pi (simde__m64* mem_addr, simde__m64 a) {
+   #elif HEDLEY_HAS_BUILTIN(__builtin_nontemporal_store) && ( \
+       defined(SIMDE_ARM_NEON_A32V7_NATIVE) || defined(SIMDE_MIPS_LOONGSON_MMI_NATIVE) || \
+       defined(SIMDE_VECTOR_SUBSCRIPT))
+-    __builtin_nontemporal_store(a, mem_addr);
++    #if defined(SIMDE_X86_MMX_USE_NATIVE_TYPE)
++      /* Windows Clang represents the native __m64 type as a union, which
++       * __builtin_nontemporal_store cannot accept. Preserve its eight bytes
++       * through the private integer lane without changing the public type. */
++      simde__m64_private a_ = simde__m64_to_private(a);
++      __builtin_nontemporal_store(a_.i64[0], HEDLEY_REINTERPRET_CAST(int64_t*, mem_addr));
++    #else
++      __builtin_nontemporal_store(a, mem_addr);
++    #endif
+   #elif defined(SIMDE_ARM_NEON_A32V7_NATIVE)
+     simde__m64_private a_ = simde__m64_to_private(a);
+     vst1_s64(HEDLEY_REINTERPRET_CAST(int64_t *, mem_addr), a_.neon_i64);

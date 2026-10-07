@@ -4,6 +4,21 @@
 
 #include "{{ project }}_init.h"
 #include <rex/system/function_dispatcher.h>
+#include <array>
+
+namespace {
+struct FunctionRegistration {
+  uint32_t guest_address;
+  ::PPCFunc* host_function;
+};
+
+// Keep registrations as constant data. A game may contain hundreds of
+// thousands of entries; emitting that many calls in one body overwhelms
+// compiler optimization and instruction selection.
+constexpr std::array<FunctionRegistration, {{ length(registrations) }}> kFunctionRegistrations = {
+{% for fn in registrations %}  FunctionRegistration{ {{ fn.address }}, {{ fn.name }} },
+{% endfor %}};
+}  // namespace
 
 {% if is_dll %}
 #ifdef _WIN32
@@ -17,8 +32,9 @@ void ReXModule_Register(rex::runtime::IModuleRegistrar* registrar) {
 {% else %}
 void {{ project }}_RegisterFunctions(rex::runtime::IModuleRegistrar* registrar) {
 {% endif %}
-{% for fn in functions %}{% if not fn.below_code_base or fn.is_import %}  registrar->SetFunction({{ fn.address }}, {{ fn.name }});
-{% endif %}{% endfor %}}
+  for (const auto& entry : kFunctionRegistrations)
+    registrar->SetFunction(entry.guest_address, entry.host_function);
+}
 
 {% if is_dll %}
 // The runtime uses this baked layout for the dispatch table. It must match the

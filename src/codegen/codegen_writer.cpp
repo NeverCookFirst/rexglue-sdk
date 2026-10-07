@@ -168,6 +168,7 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
 
   // Build functions JSON array
   nlohmann::json functionsJson = nlohmann::json::array();
+  nlohmann::json registrationsJson = nlohmann::json::array();
   for (const auto* fn : functions) {
     std::string funcName;
     bool isRexcrt = false;
@@ -191,6 +192,11 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
         {"below_code_base", (fn->base() < codeMin)},
         {"is_import", fn->authority() == rex::codegen::FunctionAuthority::IMPORT},
     });
+    // Preserve the registration order and filtering used by the mapping
+    // table, including import thunks below the executable code range.
+    if (fn->base() >= codeMin || fn->authority() == rex::codegen::FunctionAuthority::IMPORT)
+      registrationsJson.push_back({{"address", fmt::format("0x{:X}", fn->base())},
+                                   {"name", funcName}});
   }
 
   // Build config flags
@@ -217,6 +223,7 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"is_dll", ctx.isDllModule()},
       {"config_flags", configFlags},
       {"functions", functionsJson},
+      {"registrations", registrationsJson},
       {"recomp_files", nlohmann::json::array()},
   };
 }

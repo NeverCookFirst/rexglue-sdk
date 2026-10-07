@@ -41,6 +41,7 @@ std::vector<uint8_t> Bytes(bool externalHole = false) {
   put(0x20, 0x4200FFF0);  // bdnz +0x10
   put(0x24, 0x38210010);  // addi r1,r1,16
   put(0x28, 0x4E800020);  // blr
+  put(0x30, 0x4E800020);  // standalone hook target for registration tests
   if (externalHole) {
     put(0x30, 0x38210010);  // external tail callee restores existing frame
     put(0x34, 0x38E70001);  // addi r7,r7,1
@@ -140,6 +141,47 @@ int main(int argc, char** argv) try {
   auto deferred = Context(root / "deferred", config, false, kBase + 0x10);
   CodegenWriter deferredWriter(deferred);
   Check(deferredWriter.write(false), "mapped unsealed interior branch rejected");
+
+  // Exercise registration through the same actual writer as interior bodies.
+  // The below-code non-import is a rexcrt mapping so no out-of-image body is
+  // emitted. Its declaration must not become a registration.
+  auto registration = Context(root / "registration", config);
+  Check(registration.graph.addImportFunction(kBase - 8, "__imp__registration_import") != nullptr,
+        "registration import rejected");
+  Check(registration.graph.addFunction(kBase - 4, 4, FunctionAuthority::CONFIG, true) != nullptr,
+        "below-code fixture node rejected");
+  registration.Config().rexcrtFunctions["registration_suppressed"] = kBase - 4;
+  auto* hooked = registration.graph.addFunction(kBase + 0x30, 4,
+      FunctionAuthority::CONFIG, "registration_hooked", true);
+  Check(hooked != nullptr, "hook fixture node rejected");
+  hooked->discover({{kBase + 0x30, 4}}, {}, {});
+  hooked->seal();
+  CodegenWriter registrationWriter(registration);
+  Check(registrationWriter.write(false), "registration fixture emission failed");
+
+  for (const char* project : {"empty", "single", "dll"}) {
+    const std::array<uint8_t, 4> bytes{0x4E, 0x80, 0x00, 0x20};
+    TestModule module;
+    module.Load(kBase, bytes.data(), bytes.size());
+    RecompilerConfig smallConfig;
+    smallConfig.projectName = project;
+    smallConfig.outDirectoryPath = "generated";
+    auto small = CodegenContext::Create(BinaryView::fromModule(module), std::move(smallConfig));
+    small.setConfigDir(root / project);
+    small.analysisState().format = "xex";
+    small.analysisState().loadAddress = kBase;
+    small.analysisState().entryPoint = kBase;
+    small.analysisState().imageSize = bytes.size();
+    small.setDllModule(std::string_view(project) == "dll");
+    if (std::string_view(project) != "empty") {
+      auto* node = small.graph.addFunction(kBase, 4, FunctionAuthority::CONFIG, true);
+      Check(node != nullptr, "single registration node rejected");
+      node->discover({{kBase, 4}}, {}, {});
+      node->seal();
+    }
+    CodegenWriter smallWriter(small);
+    Check(smallWriter.write(false), "small registration fixture emission failed");
+  }
 
   // Capture a pending node before graph notification resolves the external
   // target. Test this stale snapshot directly with the production emitter:

@@ -1,5 +1,6 @@
 """Execute actual CodegenWriter output for explicit callable interior entries."""
 import argparse
+import json
 from pathlib import Path
 import subprocess
 
@@ -101,3 +102,91 @@ command = [args.compiler, '-std=c++23', '-O1', '-march=x86-64-v2',
 (args.output / 'compile-command.txt').write_text('\n'.join(command) + '\n')
 subprocess.run(command, check=True, timeout=40)
 subprocess.run([str(binary.resolve())], check=True, timeout=5)
+
+# Compile the actual registration source unchanged. Strong symbol hooks and
+# imports must survive constant pointer relocations just as direct calls did.
+registration = args.output / 'registration/generated'
+registration_main = args.output / 'registration.cpp'
+registration_main.write_text(r'''
+#include "interior_init.h"
+#include <rex/system/function_dispatcher.h>
+#include <cassert>
+#include <vector>
+#include <utility>
+
+void interior_RegisterFunctions(rex::runtime::IModuleRegistrar*);
+REX_EXTERN(registration_hooked) { ctx.r9.u64 = 0xC0DE; }
+REX_EXTERN(__imp__registration_import) { ctx.r8.u64 = 77; }
+
+struct Recorder : rex::runtime::IModuleRegistrar {
+  std::vector<std::pair<uint32_t, PPCFunc*>> calls;
+  bool SetFunction(uint32_t address, PPCFunc* function) override {
+    calls.emplace_back(address, function);
+    return false; // Every later entry must still be visited.
+  }
+};
+int main() {
+  Recorder recorder;
+  interior_RegisterFunctions(&recorder);
+  const std::vector<std::pair<uint32_t, PPCFunc*>> expected{
+    {0x81FFFFF8, __imp__registration_import},
+    {0x82000000, sub_82000000}, {0x82000018, sub_82000018},
+    {0x82000030, registration_hooked},
+    {0x82000040, sub_82000040}, {0x82000048, sub_82000048},
+    {0x82000080, xstart}, {0x82000088, sub_82000088}
+  };
+  assert(recorder.calls == expected); // Below-code non-import omitted; equality included.
+  assert(recorder.calls[1].second != recorder.calls[2].second);
+  assert(recorder.calls[3].second != __imp__registration_hooked);
+  alignas(32) uint8_t memory[32]{};
+  PPCContext ctx{};
+  recorder.calls[0].second(ctx, memory); assert(ctx.r8.u64 == 77);
+  recorder.calls[3].second(ctx, memory); assert(ctx.r9.u64 == 0xC0DE);
+  __imp__registration_hooked(ctx, memory); assert(ctx.r9.u64 == 0xC0DE);
+  ctx = {}; ctx.r1.u64 = 0xFF0; ctx.ctr.u64 = 3;
+  recorder.calls[2].second(ctx, memory);
+  assert(ctx.r1.u64 == 0x1000 && ctx.r3.u64 == 3 && ctx.r5.u64 == 3);
+}
+''')
+
+
+def execute_registration(directory, project, main):
+    sources = sorted(directory.glob(f'{project}_recomp.*.cpp'))
+    executable = main.with_suffix('.exe')
+    command = [args.compiler, '-std=c++23', '-O1', '-UNDEBUG', '-march=x86-64-v2',
+               '-DSPDLOG_FMT_EXTERNAL', '-I' + str(directory),
+               '-I' + str(sdk / 'include'), '-I' + str(sdk / 'thirdparty/simde'),
+               '-I' + str(sdk / 'thirdparty/fmt/include'),
+               '-I' + str(sdk / 'thirdparty/spdlog/include'),
+               *map(str, sources), str(directory / f'{project}_init.cpp'),
+               str(directory / f'{project}_register.cpp'), str(main), '-o', str(executable)]
+    main.with_suffix('.command.txt').write_text('\n'.join(command) + '\n')
+    subprocess.run(command, check=True, timeout=45)
+    subprocess.run([str(executable.resolve())], check=True, timeout=5)
+
+
+execute_registration(registration, 'interior', registration_main)
+for project, count, dll in [('empty', 0, False), ('single', 1, False), ('dll', 1, True)]:
+    small_main = args.output / f'{project}.cpp'
+    registration_declaration = ('extern "C" void ReXModule_Register(rex::runtime::IModuleRegistrar*);'
+                                if dll else f'void {project}_RegisterFunctions(rex::runtime::IModuleRegistrar*);')
+    registration_call = 'ReXModule_Register' if dll else f'{project}_RegisterFunctions'
+    small_main.write_text(f'#include "{project}_init.h"\n'
+                         '#include <rex/system/function_dispatcher.h>\n#include <cassert>\n' +
+                         registration_declaration + r'''
+struct Recorder : rex::runtime::IModuleRegistrar {
+  unsigned calls = 0;
+  bool SetFunction(uint32_t address, PPCFunc* function) override {
+    ++calls;assert(address == 0x82000000 && function);return false;
+  }
+};
+''' + f'int main(){{Recorder r;{registration_call}(&r);assert(r.calls=={count});}}\n')
+    execute_registration(args.output / project / 'generated', project, small_main)
+(args.output / 'registration-verification.json').write_text(json.dumps({
+    'passed': True, 'actual_writer_and_registration_sources': True,
+    'cases': ['sorted order', 'interior alias execution', 'strong hook relocation',
+              'import below code base', 'suppressed non-import below code base',
+              'code-base equality', 'false return continuation', 'empty', 'single', 'DLL'],
+    'limits': 'Synthetic bytes and mocked registrar; no guest runtime or game execution'
+}, indent=2) + '\n')
+print('Actual registration tables: order, imports, hooks, aliases, empty/single/DLL passed')

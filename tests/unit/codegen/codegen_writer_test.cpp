@@ -252,3 +252,40 @@ TEST_CASE("Every name a recomp file calls is declared in its header", "[codegen_
     }
   }
 }
+
+TEST_CASE("Registration is ordered constant data with the existing address filter", "[codegen_writer]") {
+  WriterFixture fx("registration_filter");
+  // Imports below code_base remain callable; a non-import rexcrt below it
+  // remains declared but has no emitted body or registration.
+  REQUIRE(fx.ctx->graph.addImportFunction(kBaseAddress - 8, "__imp__test_import"));
+  REQUIRE(fx.ctx->graph.addFunction(kBaseAddress - 4, 4, FunctionAuthority::CONFIG,
+                                  "suppressed_below_code", true));
+  fx.ctx->Config().rexcrtFunctions["suppressed_below_code"] = kBaseAddress - 4;
+  CodegenWriter writer(*fx.ctx);
+  REQUIRE(writer.write(false));
+  const auto registration = ReadAll(fx.outputDir() / "testproj_register.cpp");
+  CHECK(registration.find("std::array<FunctionRegistration, 5>") != std::string::npos);
+  CHECK(registration.find("FunctionRegistration{ 0x81FFFFF8, __imp__test_import }") != std::string::npos);
+  CHECK(registration.find("0x81FFFFFC") == std::string::npos);
+  // Equality with code_base is included, and sorted imports precede it.
+  const auto first = registration.find("FunctionRegistration{ 0x82000000, xstart }");
+  REQUIRE(first != std::string::npos);
+  CHECK(first > registration.find("FunctionRegistration{ 0x81FFFFF8"));
+  CHECK(registration.find("FunctionRegistration{ 0x82000004") > first);
+  CHECK(registration.find("registrar->SetFunction(entry.guest_address, entry.host_function)") != std::string::npos);
+}
+
+TEST_CASE("Registration handles zero and one entries and DLL exports", "[codegen_writer]") {
+  WriterFixture fx("registration_small", 1);
+  for (bool empty : {false, true}) {
+    if (empty) REQUIRE(fx.ctx->graph.removeFunction(kBaseAddress));
+    fx.ctx->setDllModule(empty);
+    CodegenWriter writer(*fx.ctx);
+    REQUIRE(writer.write(false));
+    const auto registration = ReadAll(fx.outputDir() / "testproj_register.cpp");
+    CHECK(registration.find(empty ? "std::array<FunctionRegistration, 0>"
+                                  : "std::array<FunctionRegistration, 1>") != std::string::npos);
+    CHECK(registration.find(empty ? "void ReXModule_Register(" : "void testproj_RegisterFunctions(") != std::string::npos);
+    if (empty) CHECK(registration.find("ReXModule_GetImageInfo()") != std::string::npos);
+  }
+}

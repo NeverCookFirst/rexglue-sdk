@@ -13,6 +13,10 @@
 >
 > **Building:** use the presets. `cmake --preset win-amd64` then
 > `cmake --build out/build/win-amd64 --config Release --target install`.
+> After initializing submodules, run `python3 scripts/prepare_simde.py` and
+> `python3 scripts/prepare_simde.py --check` before configuring this fork.
+> See [compatibility patch instructions](patches/README.md) for preparation and
+> offline validation of the pinned SIMDe source.
 > The x86 baseline is `REXGLUE_X86_BASELINE` (default `x86-64-v2`); the SDK's
 > byte-swap helpers need SSSE3, so plain `x86-64` will not compile. For a CPU
 > without AVX2, pass the same baseline to the game as well - see

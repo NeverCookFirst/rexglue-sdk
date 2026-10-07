@@ -22,7 +22,9 @@
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
 #include <rex/input/portal/emulated_toypad.h>
+#if REX_PLATFORM_WIN32
 #include <rex/input/portal/hardware_portal.h>
+#endif
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/input/state_merge.h>
 #include <rex/input/xinput/xinput_input_driver.h>
@@ -401,8 +403,13 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
       REXLOG_INFO("Portal: using the emulated ToyPad.");
       input->SetPortal(std::make_unique<EmulatedToypad>());
     } else {
+#if REX_PLATFORM_WIN32
       REXLOG_INFO("Portal: using a physical portal over USB.");
       input->SetPortal(std::make_unique<HardwarePortal>());
+#else
+      REXLOG_WARN("Portal: physical USB passthrough is unavailable on this platform; "
+                  "enable toypad_emulation to use the emulated ToyPad.");
+#endif
     }
   }
 

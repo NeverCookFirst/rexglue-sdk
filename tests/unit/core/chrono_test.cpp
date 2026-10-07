@@ -12,6 +12,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <type_traits>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -228,7 +229,7 @@ static uint64_t recompose(int y, unsigned m, unsigned d, int hour, int min, int 
   if (!ymd.ok())
     return 0;
   auto dp = static_cast<std::chrono::sys_days>(ymd);
-  std::chrono::system_clock::time_point time = dp;
+  std::chrono::sys_time<WinSystemClock::duration> time = dp;
   time += std::chrono::hours{hour};
   time += std::chrono::minutes{min};
   time += std::chrono::seconds{sec};
@@ -314,4 +315,33 @@ TEST_CASE("weekday c_encoding returns 0=Sunday through 6=Saturday", "[chrono]") 
   CHECK(weekday{sys_days{year{2021} / month{1} / day{1}}}.c_encoding() == 5);
   // 2000-01-01 is Saturday (6)
   CHECK(weekday{sys_days{year{2000} / month{1} / day{1}}}.c_encoding() == 6);
+}
+
+TEST_CASE("NT sys conversion preserves 100ns precision beyond host nanosecond range", "[chrono]") {
+  using namespace std::chrono;
+  using SysTime = sys_time<WinSystemClock::duration>;
+  static_assert(std::is_same_v<decltype(WinSystemClock::to_sys(WinSystemClock::time_point{})),
+                               SysTime>);
+  // Both extremes and pre-Unix fractions fit signed NT ticks, even on a
+  // nanosecond host whose system_clock cannot represent these calendar dates.
+  constexpr uint64_t end_9999 = 2650467743999999999ULL;
+  for (uint64_t ft : {uint64_t{0}, uint64_t{1}, kFtUnixEpoch - 1, kFt2021 + 1, end_9999}) {
+    auto sys = WinSystemClock::to_sys(WinSystemClock::from_file_time(ft));
+    CHECK(sys.time_since_epoch().count() == int64_t(ft) - int64_t(kFtUnixEpoch));
+    CHECK(WinSystemClock::to_file_time(WinSystemClock::from_sys(sys)) == ft);
+  }
+  // Ordinary host system_clock callers remain accepted with the same truncation
+  // to NT precision. Calendar callers may use days/seconds without a ns detour.
+  CHECK(WinSystemClock::to_file_time(WinSystemClock::from_sys(system_clock::time_point{})) ==
+        kFtUnixEpoch);
+  CHECK(WinSystemClock::to_file_time(WinSystemClock::from_sys(sys_days{year{1601} / 1 / 1})) == 0);
+  auto end = decompose(end_9999);
+  CHECK(end.year == 9999);
+  CHECK(end.month == 12);
+  CHECK(end.day == 31);
+  CHECK(end.hours == 23);
+  CHECK(end.minutes == 59);
+  CHECK(end.seconds == 59);
+  CHECK(end.milliseconds == 999);
+  CHECK(recompose(9999, 12, 31, 23, 59, 59, 999) == end_9999 - 9999);
 }

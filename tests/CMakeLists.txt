@@ -29,7 +29,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
                     --compiler ${CMAKE_CXX_COMPILER}
                     --producer $<TARGET_FILE:regression_interior_entries>)
             set_tests_properties(regression_interior_entries PROPERTIES
-                TIMEOUT 60 LABELS "regression;asset_free")
+                # Five isolated real-header compilation/link/execution cases.
+                TIMEOUT 180 LABELS "regression;asset_free")
         endif()
         foreach(check IN LISTS REXGLUE_REGRESSION_CHECKS)
             add_test(NAME regression_${check}

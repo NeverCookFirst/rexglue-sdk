@@ -16,7 +16,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
    AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
-        set(REXGLUE_REGRESSION_CHECKS app_launch timer_wait timer_lifecycle interrupt_tls graphics_interrupt_concurrency graphics_shutdown
+        set(REXGLUE_REGRESSION_CHECKS app_launch timer_wait timer_lifecycle interrupt_tls graphics_interrupt_concurrency graphics_shutdown runtime_shutdown
             vulkan_pipeline_storage shader_cache_bounds)
         foreach(check IN LISTS REXGLUE_REGRESSION_CHECKS)
             add_test(NAME regression_${check}

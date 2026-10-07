@@ -93,10 +93,12 @@ class FunctionNode {
   //=========================================================================
 
   /// Emit C++ code for this function
-  /// Requires: state() == kSealed
+  /// Requires discovered blocks; the writer validates deferred interior branches.
   /// For imports: emits REX_IMPORT macro
   /// For normal functions: emits REX_FUNC with blocks and instructions
-  std::string emitCpp(const EmitContext& ctx) const;
+  // An alternate entry retains its own symbol while using this node's body
+  // and call metadata, plus any additional blocks found from that entry.
+  std::string emitCpp(const EmitContext& ctx, const FunctionNode* entry = nullptr) const;
 
   //=========================================================================
   // Instruction access (valid after discover)
@@ -175,6 +177,7 @@ class FunctionNode {
 
   // Internal helper
   void removeUnresolvedJump(uint32_t site);
+  std::string emitCppForEntry(const EmitContext& ctx, const FunctionNode& entry) const;
 
   //=========================================================================
   // State

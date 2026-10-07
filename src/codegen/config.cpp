@@ -81,7 +81,7 @@ void MergeBool(bool& dst, bool src, bool present, const char* name) {
 // Apply a single parsed TOML table onto the config (merge semantics)
 // ---------------------------------------------------------------------------
 
-void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string& filePath) {
+bool ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string& filePath) {
   // --- Scalars: last wins ---
 
   // String scalars (only override if present in this file)
@@ -197,6 +197,14 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
       fcfg.end = (*table)["end"].value_or(0u);
       fcfg.name = (*table)["name"].value_or(std::string{});
       fcfg.parent = (*table)["parent"].value_or(0u);
+      fcfg.bodyOwner = (*table)["body"].value_or(0u);
+      if ((*table)["body"] &&
+          (!(*table)["body"].value<uint32_t>() || !fcfg.bodyOwner ||
+           (fcfg.bodyOwner & 3) != 0 || fcfg.bodyOwner == address || fcfg.parent)) {
+        REXCODEGEN_ERROR("Function 0x{:08X}: 'body' requires a different aligned owner address and cannot be combined with 'parent'",
+                         address);
+        return false;
+      }
       fcfg.shareRegisters = (*table)["share_registers"].value_or(false);
 
       if (fcfg.size && fcfg.end) {
@@ -381,6 +389,7 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
       }
     }
   }
+  return true;
 }
 
 bool ApplyTableWithIncludes(const toml::table& tbl, const std::filesystem::path& base_dir,
@@ -440,8 +449,7 @@ bool ApplyTableWithIncludes(const toml::table& tbl, const std::filesystem::path&
       }
     }
   }
-  ApplyToml(tbl, cfg, description);
-  return true;
+  return ApplyToml(tbl, cfg, description);
 }
 
 }  // namespace

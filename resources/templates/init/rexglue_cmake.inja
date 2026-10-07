@@ -108,6 +108,20 @@ macro(rexglue_setup_target target_name)
     rexglue_configure_target({{ cmake_var("target_name") }} {{ cmake_var("ARGN") }})
 endmacro()
 
+# A cross-build can reuse a host-native CLI, keeping host paths in the manifest
+# usable and avoiding a target-platform codegen executable build.
+set(REXGLUE_HOST_CODEGEN_EXECUTABLE "" CACHE FILEPATH
+    "Host-native rexglue CLI used for code generation")
+if(REXGLUE_HOST_CODEGEN_EXECUTABLE)
+    if(NOT EXISTS "{{ cmake_var("REXGLUE_HOST_CODEGEN_EXECUTABLE") }}")
+        message(FATAL_ERROR "Host rexglue CLI not found: {{ cmake_var("REXGLUE_HOST_CODEGEN_EXECUTABLE") }}")
+    endif()
+    set(REXGLUE_CODEGEN_COMMAND "{{ cmake_var("REXGLUE_HOST_CODEGEN_EXECUTABLE") }}")
+else()
+    # A target name lets CMake honor CROSSCOMPILING_EMULATOR when necessary.
+    set(REXGLUE_CODEGEN_COMMAND rex::rexglue)
+endif()
+
 # Codegen runs as part of the build, re-running only when an input in codegen.d
 # changes. Build it alone with 'cmake --build . --target {{ names.snake_case }}_codegen'.
 # Listing the sources as outputs orders any target that compiles them after
@@ -126,7 +140,8 @@ add_custom_command(
     # declares some of them inside existing functions, and emit_conditional_branch
     # cannot yet resolve a branch across such a split without emitting a goto to
     # an unlabelled address (see the comment there).
-    COMMAND $<TARGET_FILE:rex::rexglue> codegen --pointer_table_scan {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml
+    COMMAND "{{ cmake_var("REXGLUE_CODEGEN_COMMAND") }}" codegen --pointer_table_scan "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml"
+    DEPENDS "{{ cmake_var("REXGLUE_CODEGEN_COMMAND") }}"
     DEPFILE "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.d"
     WORKING_DIRECTORY {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}
     COMMENT "Generating recompiled code for {{ names.snake_case }}"

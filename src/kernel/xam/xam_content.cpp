@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+
 #include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -87,6 +89,12 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
     // Enumerate user-specific content
     auto content_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
         static_cast<uint32_t>(DummyDeviceId::HDD), xuid, XContentType(uint32_t(content_type)));
+    // Games often read only one batch (LEGO Dimensions asks for 4 saved-game items:
+    // options + 3 slots). Our "install" data cache sits next to the saves and would
+    // push the last slot out of that batch, so hand it out last.
+    std::stable_partition(
+        content_datas.begin(), content_datas.end(),
+        [](const XCONTENT_AGGREGATE_DATA& d) { return d.file_name() != "install"; });
     for (const auto& content_data : content_datas) {
       auto item = e->AppendItem();
       *item = content_data;

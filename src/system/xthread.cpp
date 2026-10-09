@@ -1031,7 +1031,10 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
         rex::thread::MaybeYield();
       }
     } else {
-      rex::thread::Sleep(std::chrono::milliseconds(timeout_ms));
+      // Guest job workers poll with Sleep(1) and other threads wait on them, so
+      // a plain OS sleep overshooting by a millisecond or more adds up every
+      // frame. Same idea as EdgeOfTimeRecomp's core/sleep.cpp (BSD-3).
+      rex::thread::SleepPrecise(std::chrono::milliseconds(timeout_ms));
     }
     CheckTitleTermination();
   }

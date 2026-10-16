@@ -25,6 +25,9 @@
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+REXCVAR_DEFINE_INT32(audio_volume, 100, "Audio",
+                     "Master volume in percent; above 100 boosts the game past its own level")
+    .range(0, 200);
 
 namespace rex::audio::sdl {
 
@@ -177,7 +180,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
   // Snapshot once. A change mid-callback would split the frame across two mixes.
   const StereoFold fold = GetStereoFold();
   const SurroundMix mix = GetSurroundMix();
-  const float gain = GetOutputGain();
+  const float gain = GetOutputGain() * (REXCVAR_GET(audio_volume) / 100.0f);
   while (additional_amount > 0) {
     static uint32_t sdl_callback_count = 0;
     std::unique_lock<std::mutex> guard(driver->frames_mutex_);

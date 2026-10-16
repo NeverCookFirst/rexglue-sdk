@@ -11,6 +11,7 @@
  */
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/string.h>
 #include <rex/string/numeric.h>
 #include <rex/ui/keybinds.h>
@@ -548,7 +549,22 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
     if (read_only)
       ImGui::BeginDisabled();
 
-    std::string current_val = entry.getter();
+    // A flag's getter and change callbacks run arbitrary code (renderer
+    // reloads and the like). One that throws would otherwise end the game
+    // from inside the settings window (#37); log it and keep going instead.
+    auto set_flag = [](const std::string& name, const std::string& value) {
+      try {
+        rex::cvar::SetFlagByName(name, value);
+      } catch (const std::exception& e) {
+        REXLOG_ERROR("Settings: setting {} = '{}' failed: {}", name, value, e.what());
+      }
+    };
+    std::string current_val;
+    try {
+      current_val = entry.getter();
+    } catch (const std::exception& e) {
+      REXLOG_ERROR("Settings: reading {} failed: {}", entry.name, e.what());
+    }
 
     const char* lifecycle_label = "";
     switch (entry.lifecycle) {
@@ -600,7 +616,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
               auto vk = ImGuiKeyToVirtualKey(imgui_key);
               std::string name = rex::ui::VirtualKeyToString(vk);
               if (!name.empty()) {
-                rex::cvar::SetFlagByName(entry.name, name);
+                set_flag(entry.name, name);
               }
               capturing_bind_name_.clear();
               break;
@@ -609,7 +625,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
           for (int mb = 0; mb < 3; ++mb) {
             if (ImGui::IsMouseClicked(mb)) {
               const char* names[] = {"LMB", "RMB", "MMB"};
-              rex::cvar::SetFlagByName(entry.name, names[mb]);
+              set_flag(entry.name, names[mb]);
               capturing_bind_name_.clear();
               break;
             }
@@ -624,12 +640,12 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("Reset##v")) {
-          rex::cvar::SetFlagByName(entry.name, entry.default_value);
+          set_flag(entry.name, entry.default_value);
         }
         ImGui::SameLine();
         // An empty bind never matches, which is how an action is turned off.
         if (ImGui::SmallButton("Clear##v")) {
-          rex::cvar::SetFlagByName(entry.name, "");
+          set_flag(entry.name, "");
         }
       }
 
@@ -695,7 +711,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
         for (const auto& [value, choice_label] : choices) {
           bool sel = (value == current_val);
           if (ImGui::Selectable(choice_label.c_str(), sel)) {
-            rex::cvar::SetFlagByName(entry.name, value);
+            set_flag(entry.name, value);
           }
           if (sel)
             ImGui::SetItemDefaultFocus();
@@ -705,7 +721,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
     } else if (entry.type == rex::cvar::FlagType::Boolean) {
       bool v = rex::string::from_string<bool>(current_val, false);
       if (ImGui::Checkbox("##v", &v)) {
-        rex::cvar::SetFlagByName(entry.name, v ? "true" : "false");
+        set_flag(entry.name, v ? "true" : "false");
       }
     } else if (entry.type == rex::cvar::FlagType::String &&
                !entry.constraints.allowed_values.empty()) {
@@ -721,7 +737,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
         for (int i = 0; i < static_cast<int>(opts.size()); ++i) {
           bool sel = (i == cur_idx);
           if (ImGui::Selectable(opts[i].c_str(), sel)) {
-            rex::cvar::SetFlagByName(entry.name, opts[i]);
+            set_flag(entry.name, opts[i]);
           }
           if (sel)
             ImGui::SetItemDefaultFocus();
@@ -737,9 +753,13 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
           entry.constraints.min.has_value() ? static_cast<int>(*entry.constraints.min) : INT_MIN;
       int vmax =
           entry.constraints.max.has_value() ? static_cast<int>(*entry.constraints.max) : INT_MAX;
-      if (ImGui::InputInt("##v", &v)) {
+      // A small bounded range (volume and the like) reads better as a slider
+      // than as a box the player has to type into.
+      const bool slider = entry.constraints.min.has_value() && entry.constraints.max.has_value() &&
+                          vmax - vmin <= 1000;
+      if (slider ? ImGui::SliderInt("##v", &v, vmin, vmax) : ImGui::InputInt("##v", &v)) {
         v = std::clamp(v, vmin, vmax);
-        rex::cvar::SetFlagByName(entry.name, std::to_string(v));
+        set_flag(entry.name, std::to_string(v));
       }
     } else if (entry.type == rex::cvar::FlagType::Double) {
       double v = std::atof(current_val.c_str());
@@ -748,7 +768,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
           v = std::max(v, *entry.constraints.min);
         if (entry.constraints.max)
           v = std::min(v, *entry.constraints.max);
-        rex::cvar::SetFlagByName(entry.name, std::to_string(v));
+        set_flag(entry.name, std::to_string(v));
       }
     } else if (entry.type == rex::cvar::FlagType::Command) {
       if (ImGui::Button(std::string(entry.name + "##v").c_str())) {
@@ -770,7 +790,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
       }
       ImGui::SetNextItemWidth(-1.0f);
       if (ImGui::InputText("##v", buf, sizeof(text_buf_), ImGuiInputTextFlags_EnterReturnsTrue)) {
-        rex::cvar::SetFlagByName(entry.name, buf);
+        set_flag(entry.name, buf);
       }
       if (ImGui::IsItemActivated()) {
         rex::string::copy_truncating(text_buf_, current_val, sizeof(text_buf_));
@@ -779,7 +799,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
         // Escape reverts the text before deactivating, so this writes back
         // what was already there and the setting is unchanged, which is what
         // Escape should do.
-        rex::cvar::SetFlagByName(entry.name, text_buf_);
+        set_flag(entry.name, text_buf_);
         editing_text_name_.clear();
       }
     }

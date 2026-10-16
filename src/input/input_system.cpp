@@ -31,6 +31,8 @@
 REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput")
     .allowed({"sdl", "xinput"});
 
+REXCVAR_DEFINE_BOOL(controller_vibration, true, "Input", "Let the game rumble controllers");
+
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
 
 REXCVAR_DEFINE_BOOL(toypad_emulation, true, "Input",
@@ -300,6 +302,13 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
   SCOPE_profile_cpu_f("hid");
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
+  // With rumble off, send zero speeds instead of dropping the call, so a
+  // motor already spinning when the option was switched off stops.
+  X_INPUT_VIBRATION silent{};
+  if (!REXCVAR_GET(controller_vibration)) {
+    vibration = &silent;
   }
 
   RefreshDevices();

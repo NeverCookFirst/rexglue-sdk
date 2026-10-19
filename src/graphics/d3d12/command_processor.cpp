@@ -3448,28 +3448,19 @@ void D3D12CommandProcessor::RetireOnDemandMemexport(bool wait) {
           on_demand_intervals_.erase(interval);
         }
       }
-      bool game_wrote = false;
-      for (const OnDemandCpuWrite& w : batch.cpu_writes) {
-        if (w.seq > seq && w.address_first < address + size && address <= w.address_last) {
-          game_wrote = true;
-          break;
-        }
-      }
+      // Always stale, not only when the game wrote these bytes: uploads are per
+      // page, so any draw since the export may have re-uploaded the page from
+      // guest memory that lacked it (another export or a CPU write elsewhere on
+      // the page), leaving the GPU copy old for good. Guest memory is the
+      // complete one once merged below.
+      stale.emplace_back(address >> 12, (address + size - 1) >> 12);
       if (i < batch.snapshot_offsets.size() && batch.snapshot_offsets[i] != UINT32_MAX) {
         // Byte-exact: whatever differs from the pre-draw snapshot is the game's.
-        if (MergeMemexportBytes(memory_->TranslatePhysical<uint8_t*>(address), source,
-                                batch.snapshot.data() + batch.snapshot_offsets[i], size)) {
-          game_wrote = true;
-        }
-        if (game_wrote) {
-          stale.emplace_back(address >> 12, (address + size - 1) >> 12);
-        }
+        MergeMemexportBytes(memory_->TranslatePhysical<uint8_t*>(address), source,
+                            batch.snapshot.data() + batch.snapshot_offsets[i], size);
         source += size;
         retired.emplace_back(address >> 12, (address + size - 1) >> 12);
         continue;
-      }
-      if (game_wrote) {
-        stale.emplace_back(address >> 12, (address + size - 1) >> 12);
       }
       uint32_t cursor = address;
       const uint32_t end = address + size;

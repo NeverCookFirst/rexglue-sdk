@@ -899,7 +899,13 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
     }
   } else {
-    REXSYS_WARN("Too few processor cores - scheduling will be wonky");
+    // Called on every guest affinity change; warn once instead of flooding
+    // the log (one player's log had ~50000 copies in 27 seconds).
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+      REXSYS_WARN("Too few processor cores ({} logical, 6 expected) - scheduling will be wonky",
+                  rex::thread::logical_processor_count());
+    }
   }
 }
 

@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -696,7 +697,28 @@ class D3D12CommandProcessor : public CommandProcessor {
     // guest, and the retire copy must keep what the game wrote meanwhile.
     bool published = false;
     std::vector<OnDemandCpuWrite> cpu_writes;
+    // Guest memory of each range as it was just before the exporting draw, in
+    // buffer order (snapshot_offsets[i] = UINT32_MAX: none was taken). The
+    // retire takes the GPU's byte only where guest memory still equals this,
+    // so every CPU write after the export survives - the watch-based
+    // cpu_writes only see the first write to a page.
+    std::vector<uint8_t> snapshot;
+    std::vector<uint32_t> snapshot_offsets;
   };
+  // Guest memory of the next exporting draw's ranges, taken before its
+  // submission opens (SnapshotOnDemandMemexport) and consumed by
+  // IssueDraw_MemexportReadbackOnDemand.
+  std::vector<uint8_t> on_demand_snapshot_scratch_;
+  std::vector<std::pair<uint32_t, uint32_t>> on_demand_snapshot_ranges_;
+  std::vector<std::vector<uint8_t>> on_demand_snapshot_free_;
+  // Exported byte ranges not retired yet, [first, end) by first. They never
+  // overlap: an export overlapping one is preceded by a full retire, since its
+  // snapshot would otherwise see guest memory without the older export.
+  std::map<uint32_t, uint32_t> on_demand_intervals_;
+  // Stale pages (see RetireOnDemandMemexport) still under a pending export.
+  std::vector<std::pair<uint32_t, uint32_t>> on_demand_stale_deferred_;
+  void SnapshotOnDemandMemexport(const D3D12Shader& vertex_shader,
+                                 const D3D12Shader* pixel_shader);
   // Submits the queued exports and protects their pages, all at once. Called
   // where the guest can learn the GPU progressed (fences, events, interrupts)
   // and before idling - the guest can't rely on the data any earlier.

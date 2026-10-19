@@ -21,6 +21,8 @@
 #include <string_view>
 #include <cstdarg>
 #include <cstring>
+#include <emmintrin.h>
+#include <iterator>
 #include <sstream>
 #include <utility>
 
@@ -2643,6 +2645,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (on_demand_unpublished_) {
     SyncOnDemandMemexportForDraw(*vertex_shader, index_buffer_info);
   }
+  // Before the shared memory upload of the export ranges below, so a CPU write
+  // landing between the two is seen as the game's (kept), not as the GPU's.
+  on_demand_snapshot_ranges_.clear();
+  if (memexport_used && on_demand_provider_set_ && REXCVAR_GET(readback_memexport_on_demand) &&
+      IsReadbackMemexportEnabled(REXCVAR_GET(d3d12_readback_memexport))) {
+    SnapshotOnDemandMemexport(*vertex_shader, memexport_used_pixel ? pixel_shader : nullptr);
+  }
 
   if (!BeginSubmission(true)) {
     return false;
@@ -3055,6 +3064,113 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   return true;
 }
 
+namespace {
+// Set while the flush itself copies into guest memory: that write faults on
+// the same watched pages, and it is not the game's.
+thread_local bool memexport_flush_writing = false;
+
+// dest = (dest == snapshot) ? gpu : dest, per byte: the GPU's export lands
+// wherever the game has not written since the snapshot. Returns whether any
+// byte the game wrote was kept.
+bool MergeMemexportBytes(uint8_t* dest, const uint8_t* gpu, const uint8_t* snapshot,
+                         uint32_t size) {
+  __m128i kept = _mm_setzero_si128();
+  uint32_t i = 0;
+  for (; i + 16 <= size; i += 16) {
+    __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dest + i));
+    __m128i g = _mm_loadu_si128(reinterpret_cast<const __m128i*>(gpu + i));
+    __m128i s = _mm_loadu_si128(reinterpret_cast<const __m128i*>(snapshot + i));
+    __m128i unchanged = _mm_cmpeq_epi8(d, s);
+    kept = _mm_or_si128(kept, _mm_andnot_si128(unchanged, _mm_set1_epi8(-1)));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dest + i),
+                     _mm_or_si128(_mm_and_si128(unchanged, g), _mm_andnot_si128(unchanged, d)));
+  }
+  bool any_kept = _mm_movemask_epi8(kept) != 0;
+  for (; i < size; ++i) {
+    if (dest[i] == snapshot[i]) {
+      dest[i] = gpu[i];
+    } else {
+      any_kept = true;
+    }
+  }
+  return any_kept;
+}
+}  // namespace
+
+void D3D12CommandProcessor::SnapshotOnDemandMemexport(const D3D12Shader& vertex_shader,
+                                                      const D3D12Shader* pixel_shader) {
+  on_demand_snapshot_ranges_.clear();
+  on_demand_snapshot_scratch_.clear();
+  std::vector<draw_util::MemExportRange> ranges;
+  const RegisterFile& regs = *register_file_;
+  if (vertex_shader.memexport_eM_written()) {
+    draw_util::AddMemExportRanges(regs, vertex_shader, ranges);
+  }
+  if (pixel_shader && pixel_shader->memexport_eM_written()) {
+    draw_util::AddMemExportRanges(regs, *pixel_shader, ranges);
+  }
+  if (ranges.empty()) {
+    return;
+  }
+  constexpr uint32_t kPhysicalMask = 0x1FFFFFFF;
+  // Bytes still owed by an older export are stale in guest memory, so a
+  // snapshot of them would make the retire keep that stale data. Land
+  // everything first (never seen in the probe runs, so this costs nothing).
+  bool overlap = false;
+  {
+    std::lock_guard<std::mutex> lock(on_demand_mutex_);
+    for (const draw_util::MemExportRange& range : ranges) {
+      if (!range.size_bytes) {
+        continue;
+      }
+      uint32_t first = (range.base_address_dwords << 2) & kPhysicalMask;
+      uint32_t end = first + range.size_bytes;
+      auto it = on_demand_intervals_.upper_bound(first);
+      if (it != on_demand_intervals_.begin() && std::prev(it)->second > first) {
+        overlap = true;
+      }
+      if (it != on_demand_intervals_.end() && it->first < end) {
+        overlap = true;
+      }
+      // A page whose GPU copy is known stale (still waiting for its reupload)
+      // would hand this export's untouched bytes back stale.
+      for (const auto& [stale_first, stale_last] : on_demand_stale_deferred_) {
+        if (stale_first <= ((end - 1) >> 12) && (first >> 12) <= stale_last) {
+          overlap = true;
+          break;
+        }
+      }
+      if (overlap) {
+        break;
+      }
+    }
+  }
+  if (overlap) {
+    MX_PROBE("snapshot-overlap-sync frame={}", frame_current_);
+    PublishOnDemandMemexport();
+    RetireOnDemandMemexport(true);
+  }
+  size_t total = 0;
+  for (const draw_util::MemExportRange& range : ranges) {
+    uint32_t first = (range.base_address_dwords << 2) & kPhysicalMask;
+    if (uint64_t(first) + range.size_bytes > 0x20000000) {
+      on_demand_snapshot_ranges_.clear();
+      return;
+    }
+    total += range.size_bytes;
+  }
+  on_demand_snapshot_scratch_.resize(total);
+  size_t offset = 0;
+  for (const draw_util::MemExportRange& range : ranges) {
+    uint32_t address = range.base_address_dwords << 2;
+    // Through the physical view, which is never protected.
+    std::memcpy(on_demand_snapshot_scratch_.data() + offset,
+                memory_->TranslatePhysical(address & kPhysicalMask), range.size_bytes);
+    on_demand_snapshot_ranges_.emplace_back(address, range.size_bytes);
+    offset += range.size_bytes;
+  }
+}
+
 bool D3D12CommandProcessor::IssueDraw_MemexportReadbackOnDemand(uint32_t total_size) {
   if (!total_size || memexport_ranges_.empty()) {
     return true;
@@ -3114,7 +3230,21 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackOnDemand(uint32_t total_s
     batch.buffer = buffer;
     batch.first_seq = on_demand_seq_.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(on_demand_mutex_);
+    if (!on_demand_snapshot_free_.empty()) {
+      batch.snapshot = std::move(on_demand_snapshot_free_.back());
+      on_demand_snapshot_free_.pop_back();
+      batch.snapshot.clear();
+    }
     on_demand_pending_.push_back(std::move(batch));
+  }
+
+  // The snapshot was taken for exactly these ranges unless the draw's state
+  // changed in between (it can't, but never merge against the wrong bytes).
+  bool have_snapshot = on_demand_snapshot_ranges_.size() == memexport_ranges_.size();
+  for (size_t i = 0; have_snapshot && i < memexport_ranges_.size(); ++i) {
+    have_snapshot = on_demand_snapshot_ranges_[i].first ==
+                        (memexport_ranges_[i].base_address_dwords << 2) &&
+                    on_demand_snapshot_ranges_[i].second == memexport_ranges_[i].size_bytes;
   }
 
   shared_memory_->UseAsCopySource();
@@ -3149,7 +3279,23 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackOnDemand(uint32_t total_s
     batch.ranges.emplace_back(address, memexport_range.size_bytes);
     batch.used += memexport_range.size_bytes;
     on_demand_seq_.fetch_add(1, std::memory_order_release);
+    uint32_t interval_first = address & 0x1FFFFFFF;
+    uint32_t& interval_end = on_demand_intervals_[interval_first];
+    interval_end = std::max(interval_end, interval_first + memexport_range.size_bytes);
   }
+  if (have_snapshot) {
+    size_t offset = 0;
+    for (const auto& [address, size] : on_demand_snapshot_ranges_) {
+      batch.snapshot_offsets.push_back(uint32_t(batch.snapshot.size()));
+      batch.snapshot.insert(batch.snapshot.end(), on_demand_snapshot_scratch_.begin() + offset,
+                            on_demand_snapshot_scratch_.begin() + offset + size);
+      offset += size;
+    }
+  } else {
+    batch.snapshot_offsets.insert(batch.snapshot_offsets.end(), memexport_ranges_.size(),
+                                  UINT32_MAX);
+  }
+  on_demand_snapshot_ranges_.clear();
   batch.submission = submission_current_;
   on_demand_unpublished_ = true;
   on_demand_recording_.store(true, std::memory_order_release);
@@ -3284,6 +3430,10 @@ void D3D12CommandProcessor::RetireOnDemandMemexport(bool wait) {
   // In queue order, so a later export of the same bytes wins. Bytes the game
   // wrote after an export was queued (but before it was published) are kept.
   std::vector<std::pair<uint32_t, uint32_t>> retired;  // pages [first, last]
+  // Pages whose host GPU copy may now be older than guest memory: the game
+  // wrote them after the export, so the shared memory may have re-uploaded
+  // them from guest memory that did not have the export yet.
+  std::vector<std::pair<uint32_t, uint32_t>> stale;  // pages [first, last]
   while (!on_demand_pending_.empty() && on_demand_pending_.front().published &&
          on_demand_pending_.front().submission <= completed) {
     OnDemandReadback& batch = on_demand_pending_.front();
@@ -3291,6 +3441,36 @@ void D3D12CommandProcessor::RetireOnDemandMemexport(bool wait) {
     for (size_t i = 0; i < batch.ranges.size(); ++i) {
       const auto [address, size] = batch.ranges[i];
       const uint64_t seq = batch.first_seq + i;
+      {
+        auto interval = on_demand_intervals_.find(address & 0x1FFFFFFF);
+        if (interval != on_demand_intervals_.end() &&
+            interval->second <= (address & 0x1FFFFFFF) + size) {
+          on_demand_intervals_.erase(interval);
+        }
+      }
+      bool game_wrote = false;
+      for (const OnDemandCpuWrite& w : batch.cpu_writes) {
+        if (w.seq > seq && w.address_first < address + size && address <= w.address_last) {
+          game_wrote = true;
+          break;
+        }
+      }
+      if (i < batch.snapshot_offsets.size() && batch.snapshot_offsets[i] != UINT32_MAX) {
+        // Byte-exact: whatever differs from the pre-draw snapshot is the game's.
+        if (MergeMemexportBytes(memory_->TranslatePhysical<uint8_t*>(address), source,
+                                batch.snapshot.data() + batch.snapshot_offsets[i], size)) {
+          game_wrote = true;
+        }
+        if (game_wrote) {
+          stale.emplace_back(address >> 12, (address + size - 1) >> 12);
+        }
+        source += size;
+        retired.emplace_back(address >> 12, (address + size - 1) >> 12);
+        continue;
+      }
+      if (game_wrote) {
+        stale.emplace_back(address >> 12, (address + size - 1) >> 12);
+      }
       uint32_t cursor = address;
       const uint32_t end = address + size;
       while (cursor < end) {
@@ -3324,8 +3504,57 @@ void D3D12CommandProcessor::RetireOnDemandMemexport(bool wait) {
       retired.emplace_back(address >> 12, (address + size - 1) >> 12);
     }
     OnDemandReadbackBuffer buffer = batch.buffer;
+    if (batch.snapshot.capacity() && on_demand_snapshot_free_.size() < 8) {
+      on_demand_snapshot_free_.push_back(std::move(batch.snapshot));
+    }
     on_demand_pending_.pop_front();
     on_demand_free_.push_back(buffer);
+  }
+  // Have the shared memory reupload stale pages from the merged guest memory -
+  // but only once no pending export covers them, as that reupload would
+  // overwrite the newer export still only in GPU memory.
+  stale.insert(stale.end(), on_demand_stale_deferred_.begin(), on_demand_stale_deferred_.end());
+  on_demand_stale_deferred_.clear();
+  if (!stale.empty()) {
+    std::vector<std::pair<uint32_t, uint32_t>> pending_pages;
+    for (const OnDemandReadback& batch : on_demand_pending_) {
+      for (const auto& [address, size] : batch.ranges) {
+        pending_pages.emplace_back(address >> 12, (address + size - 1) >> 12);
+      }
+    }
+    std::sort(stale.begin(), stale.end());
+    memexport_flush_writing = true;
+    for (size_t i = 0; i < stale.size();) {
+      uint32_t first = stale[i].first, last = stale[i].second;
+      for (++i; i < stale.size() && stale[i].first <= last + 1; ++i) {
+        last = std::max(last, stale[i].second);
+      }
+      uint32_t run_first = UINT32_MAX;
+      for (uint32_t page = first; page <= last + 1; ++page) {
+        bool pending = false;
+        if (page <= last) {
+          for (const auto& [pending_first, pending_last] : pending_pages) {
+            if (page >= pending_first && page <= pending_last) {
+              pending = true;
+              break;
+            }
+          }
+          if (pending) {
+            on_demand_stale_deferred_.emplace_back(page, page);
+          }
+        }
+        bool invalidate = page <= last && !pending;
+        if (invalidate && run_first == UINT32_MAX) {
+          run_first = page;
+        } else if (!invalidate && run_first != UINT32_MAX) {
+          shared_memory_->MemoryInvalidationCallback(run_first << 12, (page - run_first) << 12,
+                                                     true);
+          run_first = UINT32_MAX;
+        }
+      }
+    }
+    memexport_flush_writing = false;
+    MX_PROBE("retire-stale runs={} deferred={}", stale.size(), on_demand_stale_deferred_.size());
   }
   if (!retired.empty()) {
     MX_PROBE("retire wait={} thread={} retired_batches={} left={} unpublished_left={}", wait,
@@ -3444,12 +3673,6 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackBatched(uint32_t total_si
                                 std::memory_order_release);
   return true;
 }
-
-namespace {
-// Set while the flush itself copies into guest memory: that write faults on
-// the same watched pages, and it is not the game's.
-thread_local bool memexport_flush_writing = false;
-}  // namespace
 
 void D3D12CommandProcessor::MemexportCpuWriteWatchThunk(
     const std::unique_lock<std::recursive_mutex>& global_lock, void* context,

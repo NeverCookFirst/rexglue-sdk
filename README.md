@@ -79,3 +79,10 @@ The list above is not exhaustive. Thanks to everyone in the ReXGlue community wh
 - [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) - For pioneering the modern static recompilation approach for Xbox 360. A lot of the codegen analysis logic and instruction translations are based on their work. Thank you!
 - [rexdex's recompiler](https://github.com/rexdex/recompiler) - The OG static recompiler for Xbox 360. 
 - Many others in the Xbox 360 homebrew and modding communities whose work and research have contributed to the collective knowledge that makes projects like this possible.
+
+## Dimensions Recompiled handoff
+
+I have ended my work on Dimensions Recompiled. This repository is preserved as a read-only reference. The existing source and any release downloads remain available.
+
+- [Final Native GPU release](https://github.com/NeverCookFirst/DimensionsRecomp/releases/tag/v0.2.0)
+- [Project handoff and original build](https://github.com/NeverCookFirst/DimensionsRecomp/blob/main/PROJECT-HANDOFF.md)
